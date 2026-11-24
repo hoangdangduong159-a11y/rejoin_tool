@@ -151,6 +151,7 @@ def import_shouko_environment(
     change_config_path=None,
     shared_autoexec=None,
     shared_workspace=None,
+    persist_config=False,
 ):
     """Safely import plain-text configs, cookies, links, and Lua scripts from Shouko/Download."""
     summary = {
@@ -242,7 +243,7 @@ def import_shouko_environment(
                             "enabled": True,
                         })
                         summary["links_imported"] += 1
-            if summary["links_imported"] > 0:
+            if summary["links_imported"] > 0 and persist_config:
                 save_config(cfg)
             break
 

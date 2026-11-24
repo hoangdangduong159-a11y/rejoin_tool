@@ -132,6 +132,16 @@ label.chk input{width:auto}
 </div>
 <div id="toast"></div>
 <script>
+(() => {
+  const p = new URLSearchParams(location.search);
+  const qt = p.get('token');
+  if (qt) {
+    localStorage.setItem('rj_token', qt.trim());
+    p.delete('token');
+    const qs = p.toString();
+    history.replaceState(null, '', location.pathname + (qs ? '?' + qs : ''));
+  }
+})();
 const BF_BOOLS = ['god_human','sanguine_art','cursed_dual_katana','true_triple_katana','shark_anchor','skull_guitar','mirror_fractal','valkyrie_helm','pull_level'];
 let bfInit = false;
 function hdrs(json){
