@@ -1,10 +1,12 @@
 """Core helpers: android/root, Roblox API, cookie DB, appStorage sync, files, logging, credential store."""
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import fcntl
 import json
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import threading
@@ -58,7 +60,7 @@ _EXCLUDED_PACKAGES = {
     "ahapps.controlthescreenorientation",
 }
 _ROBLOX_PKG_RE = re.compile(
-    r"^(com\.roblox|free\.noka|com\.delta|com\.codex|com\.arceus|com\.fluxus|com\.cryptic|com\.vegax)",
+    r"^(com\.roblox|com\.vng\.roblox|free\.noka|com\.delta|com\.codex|com\.arceus|com\.fluxus|com\.cryptic|com\.vegax|vip\.|.*samehwid|.*clone)",
     re.IGNORECASE,
 )
 
@@ -128,7 +130,7 @@ DEFAULT_CHANGE_CONFIG = {
     "fragment": 0,
     "bounty/honor": 0,
     "tier": 0,
-    "race_ver": "",
+    "race_ver": 0,
     "pull_level": False,
     "god_human": False,
     "sanguine_art": False,
@@ -220,6 +222,33 @@ def parse_custom_change_trigger(text):
     return empty
 
 
+def _normalize_race_ver(val):
+    if val is None or isinstance(val, bool):
+        return 0
+    if isinstance(val, (int, float)):
+        return max(0, int(val))
+    s = str(val).strip()
+    if not s or s == "0":
+        return 0
+    if s.isdigit():
+        return max(0, int(s))
+    return s
+
+
+def _extract_race_tier(val):
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        iv = int(val)
+        return iv if 1 <= iv <= 4 else None
+    s = str(val).strip()
+    if s.isdigit():
+        iv = int(s)
+        return iv if 1 <= iv <= 4 else None
+    m = re.search(r"\bv?([1-4])\b", s, re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
 def load_change_config(path=None):
     """Load config-change.json (Blox Fruits auto-change criteria), coercing invalid fields safely."""
     p = path or CHANGE_CONFIG
@@ -238,7 +267,7 @@ def load_change_config(path=None):
             conf[k] = val.strip().lower() in ("true", "1", "yes", "on")
         else:
             conf[k] = bool(val)
-    conf["race_ver"] = str(raw.get("race_ver") or "").strip()
+    conf["race_ver"] = _normalize_race_ver(raw.get("race_ver", conf["race_ver"]))
     return conf
 
 
@@ -257,7 +286,7 @@ def save_change_config(conf, path=None):
                 normalized[k] = val.strip().lower() in ("true", "1", "yes", "on")
             else:
                 normalized[k] = bool(val)
-        normalized["race_ver"] = str(conf.get("race_ver") or "").strip()
+        normalized["race_ver"] = _normalize_race_ver(conf.get("race_ver", 0))
     save_json(path or CHANGE_CONFIG, normalized)
     return normalized
 
@@ -310,13 +339,27 @@ def info_matches_change_config(info, conf):
                 return False, []
             reasons.append(k)
 
-    req_race = str(conf.get("race_ver") or "").strip()
+    req_race = _normalize_race_ver(conf.get("race_ver"))
     if req_race:
         active_checks += 1
         actual_race = _lookup_info_value(info, "race_ver")
-        if actual_race is None or req_race.lower() not in str(actual_race).lower():
-            return False, []
-        reasons.append(f"race={req_race}")
+        actual_tier = _extract_race_tier(actual_race)
+        if actual_tier is None:
+            actual_tier = _extract_race_tier(_lookup_info_value(info, "tier"))
+        if isinstance(req_race, int):
+            if actual_tier is None or actual_tier < req_race:
+                return False, []
+            reasons.append(f"race_v>={req_race}")
+        else:
+            req_tier = _extract_race_tier(req_race)
+            req_name = re.sub(r"\bv?[1-4]\b", "", str(req_race), flags=re.IGNORECASE).strip()
+            if req_name:
+                if actual_race is None or req_name.lower() not in str(actual_race).lower():
+                    return False, []
+            if req_tier is not None:
+                if actual_tier is None or actual_tier < req_tier:
+                    return False, []
+            reasons.append(f"race={req_race}")
 
     return active_checks > 0, reasons
 
@@ -347,6 +390,15 @@ def load_config():
     cfg.setdefault("focus_before_kill", True)
     cfg.setdefault("sync_shared_scripts", True)
     cfg.setdefault("package_prefix", "")
+    cfg.setdefault("web_enabled", False)
+    cfg.setdefault("web_host", "127.0.0.1")
+    cfg.setdefault("web_port", 8787)
+    cfg.setdefault("web_token", "")
+    cfg.setdefault("download_hub_sync", True)
+    cfg.setdefault("download_hub_dir", "/storage/emulated/0/Download/RejoinTool")
+    cfg.setdefault("auto_dismiss_anr", True)
+    cfg.setdefault("server_hop_on_disconnect", False)
+    cfg.setdefault("error_264_action", "cooldown")
     cfg.setdefault("instances", [])
     return cfg
 
@@ -365,7 +417,7 @@ DEFAULT_PROFILE = {
     "launch_grace": 90,
     "poll_interval": 3,
     "max_rejoins_before_rotate": 0,
-    "check_method": "executor",
+    "check_method": "hybrid",
     "check_presence": False,
     "presence_recheck_strikes": 3,
     "presence_poll_seconds": 30,
@@ -374,6 +426,7 @@ DEFAULT_PROFILE = {
     "retire_on_deleted": False,
     "clear_cache_on_rejoin": False,
     "custom_change_watch": True,
+    "server_hop": False,
     "max_ram_mb": 0,
     "fps_cap": 0,
     "window_mode": "default",
@@ -503,6 +556,50 @@ def detect_packages(prefix=""):
             elif _ROBLOX_PKG_RE.match(p):
                 pk.append(p)
     return pk
+
+
+def read_clone_metadata(pkg):
+    """Read AppCloner cloneSettings.json metadata (app_name, clone_number, badge) if present."""
+    if not pkg:
+        return {}
+    path = f"/data/data/{pkg}/files/cloneSettings.json"
+    data = load_json(path, None)
+    if data is None:
+        rc, out, _ = su(f"test -f {shlex.quote(path)} && cat {shlex.quote(path)}", 8)
+        if rc == 0 and out:
+            try:
+                data = json.loads(out)
+            except ValueError:
+                data = None
+    if not isinstance(data, dict):
+        return {}
+    return {
+        "app_name": str(data.get("name") or "").strip(),
+        "clone_number": data.get("cloneNumber"),
+        "badge": str(data.get("badge") or "").strip(),
+    }
+
+
+def suggest_instance_name(pkg, index=1, metadata=None, used_names=None):
+    """Choose a readable instance name from AppCloner metadata or package name."""
+    meta = metadata if metadata is not None else read_clone_metadata(pkg)
+    used = set(used_names or ())
+    cnum = meta.get("clone_number")
+    badge = str(meta.get("badge") or "").strip()
+    if isinstance(cnum, int) and cnum > 0:
+        cand = f"clone{cnum}"
+    elif badge.isdigit():
+        cand = f"clone{badge}"
+    elif "noka" in (pkg or "").lower():
+        cand = f"noka{index}"
+    else:
+        cand = f"inst{index}"
+    if cand not in used:
+        return cand
+    suffix = 2
+    while f"{cand}_{suffix}" in used:
+        suffix += 1
+    return f"{cand}_{suffix}"
 
 
 def is_vng_package(pkg):
@@ -847,6 +944,49 @@ def resolve_share(cookie, code):
     return None, None
 
 
+def pick_public_server(place_id, cookie=None, exclude_jobs=None, prefer_low_players=True, timeout=12):
+    """Pick an available public server job_id for place_id (with RoProxy fallback), avoiding exclude_jobs."""
+    if not place_id:
+        return None
+    excluded = {str(j) for j in (exclude_jobs or ()) if j}
+    headers = _ck(cookie) if cookie else dict(UA)
+    order = "Asc" if prefer_low_players else "Desc"
+    for base_host in ("https://games.roblox.com", "https://games.roproxy.com"):
+        url = f"{base_host}/v1/games/{int(place_id)}/servers/Public?sortOrder={order}&limit=100"
+        try:
+            r = requests.get(url, headers=headers, timeout=timeout)
+            if r.status_code != 200:
+                continue
+            servers = r.json().get("data") or []
+            candidates = []
+            for srv in servers:
+                sid = str(srv.get("id") or "").strip()
+                playing = int(srv.get("playing") or 0)
+                max_p = int(srv.get("maxPlayers") or 0)
+                if not sid or sid in excluded:
+                    continue
+                if max_p > 1 and playing >= max_p - 1:
+                    continue
+                candidates.append((playing, sid))
+            if candidates:
+                candidates.sort(key=lambda x: x[0], reverse=not prefer_low_players)
+                return candidates[0][1]
+        except Exception:
+            continue
+    return None
+
+
+def validate_cookies_parallel(cookies, max_workers=8):
+    """Validate a list of cookies concurrently via inspect_account_health()."""
+    items = [c for c in (cookies or []) if c]
+    if not items:
+        return []
+    workers = max(1, min(int(max_workers or 8), len(items)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(inspect_account_health, items))
+    return [{"cookie": ck, **res} for ck, res in zip(items, results)]
+
+
 def parse_target(text):
     """Parse game id / games URL / private-server URL / share URL / roblox:// URI."""
     t = (text or "").strip()
@@ -1127,6 +1267,22 @@ def sync_app_storage(pkg, user_id, username, display_name=None):
     return rc2 == 0
 
 
+def _ensure_template_cookie_db():
+    """Create and cache a clean Chromium v14 template SQLite DB for instant fresh-clone injection."""
+    tpl = os.path.join(TMP, "template_cookies_v14.db")
+    if os.path.isfile(tpl) and os.path.getsize(tpl) > 0:
+        return tpl
+    tmp_tpl = f"{tpl}.{os.getpid()}.{threading.get_ident()}.tmp"
+    con = sqlite3.connect(tmp_tpl)
+    try:
+        con.executescript(_CHROMIUM_V14_SCHEMA)
+        con.commit()
+    finally:
+        con.close()
+    os.replace(tmp_tpl, tpl)
+    return tpl
+
+
 def write_app_cookie(pkg, cookie, user_id=None, username=None, display_name=None):
     """Inject cookie atomically into app's WebView DB (even on fresh clones) and sync appStorage. App MUST be stopped."""
     local = _fetch_db(pkg)
@@ -1135,6 +1291,11 @@ def write_app_cookie(pkg, cookie, user_id=None, username=None, display_name=None
         fresh = True
         local = os.path.join(TMP, f"{pkg}_{os.getpid()}_{threading.get_ident()}_fresh.db")
         _cleanup_local_db(local)
+        try:
+            tpl = _ensure_template_cookie_db()
+            shutil.copy2(tpl, local)
+        except (OSError, sqlite3.Error):
+            pass
     try:
         if not fresh:
             bak = os.path.join(TMP, f"{pkg}.db.bak")
@@ -1481,3 +1642,43 @@ class Store:
             else:
                 st["assigned"][inst] = data
             atomic_write(self.state_path, json.dumps(st, indent=2))
+
+    def prune_invalid_cookies(self, max_workers=8, validator=None):
+        """Concurrently validate cookies in cookies.txt and archive dead/challenged entries."""
+        q = self.queue()
+        if not q:
+            return {"total": 0, "ok": 0, "dead": 0, "challenge": 0, "error": 0, "details": []}
+
+        if validator is None:
+            details = validate_cookies_parallel(q, max_workers=max_workers)
+        else:
+            details = [{"cookie": ck, **validator(ck)} for ck in q]
+
+        kept = []
+        summary = {"total": len(details), "ok": 0, "dead": 0, "challenge": 0, "error": 0, "details": details}
+        for item in details:
+            ck = item["cookie"]
+            st = item.get("state") or "error"
+            uname = item.get("username") or "?"
+            reason = item.get("reason") or st
+            if st == "ok":
+                kept.append(ck)
+                summary["ok"] += 1
+            elif st == "error":
+                kept.append(ck)
+                summary["error"] += 1
+            elif st in ("expired", "banned", "deleted", "warning"):
+                summary["dead"] += 1
+                self.add_dead(uname, ck, f"prune_{reason}")
+                if st != "expired":
+                    self.add_switched(st, uname, ck, reason)
+            elif st in ("captcha", "faceid", "captcha_lock"):
+                summary["challenge"] += 1
+                self.add_switched(st.replace("_", "-"), uname, ck, reason)
+            else:
+                kept.append(ck)
+                summary["error"] += 1
+
+        with self.lock, _file_lock(self.lock_file):
+            atomic_write(self.cookies_path, "\n".join(kept) + ("\n" if kept else ""))
+        return summary

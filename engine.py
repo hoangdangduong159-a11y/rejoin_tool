@@ -1,4 +1,4 @@
-"""Multi-instance monitor engine: dual check modes (executor/online), health classification, IPC reload, tab sorting."""
+"""Multi-instance monitor engine: hybrid check modes (hybrid/executor/online), log watcher, ANR recovery, IPC & Web Panel."""
 from dataclasses import dataclass, field
 import glob
 import os
@@ -6,6 +6,7 @@ import threading
 import time
 
 from ipc import DEFAULT_IPC_SOCK, IPCServer
+from log_watch import BatchLogWatcher, detect_anr_or_crash_packages
 from lua_deploy import deploy_heartbeat
 from rjcore import (
     BLOCK_CACHE,
@@ -29,10 +30,12 @@ from rjcore import (
     load_profile,
     parse_custom_change_trigger,
     parse_target,
+    pick_public_server,
     read_app_cookie,
     read_app_storage_identity,
     resolve_share,
     sanitize_switch_type,
+    save_config,
     save_json,
     short,
     su,
@@ -40,6 +43,7 @@ from rjcore import (
     write_app_cookie,
 )
 from rules import compile_rules, evaluate_rules
+from shared_hub import DEFAULT_HUB_DIR, ingest_hot_cookies, mirror_outputs_to_download
 from sysutils import (
     apply_low_graphics,
     capture_screenshot,
@@ -47,6 +51,7 @@ from sysutils import (
     get_batch_pkg_usage,
     get_pkg_ram_mb,
     get_system_stats,
+    optimize_cloud_device,
     remove_package_tasks,
     scan_executor_dirs,
     send_discord_embed,
@@ -54,6 +59,7 @@ from sysutils import (
     sort_roblox_tabs,
     stop_package,
 )
+from web_panel import WebPanelServer
 
 
 @dataclass
@@ -72,11 +78,13 @@ class InstanceState:
     rejoin_count: int = 0
     rotate_count: int = 0
     consecutive_fails: int = 0
-    check_method: str = "executor"
+    check_method: str = "hybrid"
     presence_strikes: int = 0
     account_state: str = "unknown"
     stats: dict = field(default_factory=dict)
     last_event: str = ""
+    current_job_id: str = ""
+    last_error_code: int | None = None
     account_started_at: float = 0.0
     session_started_at: float = 0.0
 
@@ -101,6 +109,8 @@ class InstanceState:
             "account_state": self.account_state,
             "stats": dict(self.stats),
             "last_event": self.last_event,
+            "current_job_id": self.current_job_id,
+            "last_error_code": self.last_error_code,
             "account_started_at": self.account_started_at,
             "session_started_at": self.session_started_at,
         }
@@ -116,6 +126,9 @@ class InstanceWorker(threading.Thread):
         self.log = manager.logger
         self.stop_event = manager.stop_event
         self.force_rotate_reason = None
+        self.force_rejoin_reason = None
+        self._pending_job_id = None
+        self._latest_log = None
         self._state_lock = threading.Lock()
         self._has_profile_override = profile_override is not None
 
@@ -188,6 +201,23 @@ class InstanceWorker(threading.Thread):
 
     def request_rotate(self, reason="manual"):
         self.force_rotate_reason = reason
+
+    def request_rejoin(self, reason="manual"):
+        self.force_rejoin_reason = reason
+
+    def update_log_state(self, parsed):
+        if not isinstance(parsed, dict):
+            return
+        with self._state_lock:
+            self._latest_log = dict(parsed)
+            if parsed.get("job_id"):
+                self.state.current_job_id = str(parsed["job_id"])
+            if parsed.get("error_code") is not None:
+                self.state.last_error_code = parsed["error_code"]
+
+    def _get_log_state(self):
+        with self._state_lock:
+            return dict(self._latest_log) if self._latest_log else None
 
     def _hb_dir(self):
         return os.path.join(self.workspace, "rejoin")
@@ -595,8 +625,17 @@ class InstanceWorker(threading.Thread):
                 if self.stop_event.is_set():
                     return
 
+            launch_uri = self.target_uri
+            if self._pending_job_id and self.target_place_id:
+                launch_uri = build_uri(self.target_place_id, None, self._pending_job_id)
+            self._pending_job_id = None
+            with self._state_lock:
+                self._latest_log = None
+                self.state.current_job_id = ""
+                self.state.last_error_code = None
+
             self._set_state(status="LAUNCHING", presence_strikes=0, last_event=reason)
-            self.log(self.state.name, f"Launching ({reason}) -> {self.target_uri}")
+            self.log(self.state.name, f"Launching ({reason}) -> {launch_uri}")
             self._delete_old_hb()
             if not self.dry_run:
                 self._stop_pkg()
@@ -610,7 +649,7 @@ class InstanceWorker(threading.Thread):
                     extra = (extra + " --windowingMode 5").strip()
                 rc, _, err = launch(
                     self.state.package,
-                    self.target_uri,
+                    launch_uri,
                     extra,
                     open_splash_first=bool(self.profile.get("open_splash_first", False)),
                     splash_delay=float(self.mgr.config.get("open_delay_seconds") or 2.0),
@@ -792,6 +831,70 @@ class InstanceWorker(threading.Thread):
             sync_shared=bool(self.mgr.config.get("sync_shared_scripts", True)),
         )
 
+    def _handle_log_disconnect(self, log_info):
+        """Handle native Roblox client log disconnect / error codes."""
+        code = log_info.get("error_code")
+        msg = log_info.get("message") or f"err_{code or 'disc'}"
+        self._set_state(last_error_code=code, last_event=f"log_err_{code}" if code else "log_disconnect")
+        self.log(self.state.name, f"Log disconnect detected (code={code}): {msg[:80]}")
+
+        now = time.time()
+        ctx = {
+            "hb": {"status": "kicked" if code == 267 else "disconnected", "kicked": code == 267, "kickMsg": msg, "stats": dict(self.state.stats)},
+            "account_state": self.state.account_state,
+            "elapsed_account_sec": now - (self.state.account_started_at or now),
+            "elapsed_session_sec": now - (self.state.session_started_at or now),
+            "consecutive_fails": self.state.consecutive_fails,
+            "notified_rules": self.notified_rules,
+        }
+        outcome = self._eval_and_apply_rules(ctx)
+        if outcome in ("break", "continue"):
+            return outcome
+
+        if code == 268:
+            if not self.dry_run:
+                clear_app_cache(self.state.package)
+                self.stop_event.wait(10.0)
+            self._set_state(status="REJOINING", rejoin_count=self.state.rejoin_count + 1)
+            self._launch("err_268_cache_cleared")
+            return "continue"
+
+        if code == 264:
+            if str(self.mgr.config.get("error_264_action") or "cooldown").lower() == "rotate":
+                return "continue" if self._rotate("err_264_same_account", dead=False) else "break"
+            if not self.dry_run:
+                self.stop_event.wait(15.0)
+            self._set_state(status="REJOINING", rejoin_count=self.state.rejoin_count + 1)
+            self._launch("err_264_cooldown")
+            return "continue"
+
+        if code == 273:
+            h_res = self._handle_passive_health_check()
+            if h_res in ("break", "continue"):
+                return h_res
+
+        if (
+            (self.mgr.config.get("server_hop_on_disconnect") or self.profile.get("server_hop"))
+            and not self.dry_run
+            and self.target_place_id
+            and "linkCode=" not in (self.target_uri or "")
+        ):
+            hop_job = pick_public_server(
+                self.target_place_id,
+                self.cookie,
+                exclude_jobs=self.mgr.active_job_ids(exclude=self.state.name),
+            )
+            if hop_job:
+                self._pending_job_id = hop_job
+                self.log(self.state.name, f"Server-hop selected fresh JobId {hop_job[:8]}...")
+
+        fails = self.state.consecutive_fails + 1
+        self._set_state(status="REJOINING", consecutive_fails=fails, rejoin_count=self.state.rejoin_count + 1)
+        if not self.dry_run:
+            self.stop_event.wait(min(15.0, 2.0 * fails))
+        self._launch(f"log_err_{code or 'disc'}")
+        return "continue"
+
     def _eval_and_apply_rules(self, ctx):
         act, reason = evaluate_rules(self.rules, ctx)
         if act == "stop":
@@ -856,6 +959,13 @@ class InstanceWorker(threading.Thread):
                     break
                 continue
 
+            if self.force_rejoin_reason:
+                rj = self.force_rejoin_reason
+                self.force_rejoin_reason = None
+                self._set_state(status="REJOINING", rejoin_count=self.state.rejoin_count + 1)
+                self._launch(rj)
+                continue
+
             if self.state.status == "WAITING_COOKIE":
                 if self.store.counts()["queue"] > 0 and self._pop_and_inject_next():
                     self._resolve_target()
@@ -868,7 +978,7 @@ class InstanceWorker(threading.Thread):
             rejoin_min = float(self.profile.get("rejoin_after_minutes") or 0)
             rotate_min = float(self.profile.get("rotate_after_minutes") or 0)
             max_ram_mb = float(self.profile.get("max_ram_mb") or 0)
-            check_method = str(self.profile.get("check_method") or "executor").lower()
+            check_method = str(self.profile.get("check_method") or "hybrid").lower()
 
             if rotate_min > 0 and self.state.account_started_at > 0:
                 if (now - self.state.account_started_at) >= rotate_min * 60.0:
@@ -898,12 +1008,22 @@ class InstanceWorker(threading.Thread):
                     self._launch("challenge_cleared")
                 continue
 
-            # Check Workspace custom / info-file triggers in BOTH executor & online modes
+            # Check Workspace custom / info-file triggers in ALL modes
             ws_act = self._check_workspace_account_change(hb=None)
             if ws_act == "break":
                 break
             if ws_act == "continue":
                 continue
+
+            # Check native Roblox client log disconnects in ALL modes
+            log_info = self._get_log_state()
+            disc_grace = 1.5 if self.dry_run else 10.0
+            if log_info and log_info.get("state") == "disconnected" and (now - self.launch_ts) > disc_grace:
+                d_res = self._handle_log_disconnect(log_info)
+                if d_res == "break":
+                    break
+                if d_res == "continue":
+                    continue
 
             # ── Mode A: Online Presence Check (non-executor / VNG) ──
             if check_method == "online":
@@ -973,6 +1093,8 @@ class InstanceWorker(threading.Thread):
                     updates["username"] = str(hb["username"])
                 if hb.get("userId") and self.state.user_id is None:
                     updates["user_id"] = int(hb["userId"])
+                if hb.get("jobId"):
+                    updates["current_job_id"] = str(hb["jobId"])
                 if hb_age <= hb_timeout:
                     updates["status"] = "RUNNING"
                 self._set_state(**updates)
@@ -1060,6 +1182,25 @@ class InstanceWorker(threading.Thread):
             else:
                 proc_dead = (not self.dry_run) and (now - self.launch_ts > 15.0) and (not is_running(self.state.package))
                 grace_expired = (now - self.launch_ts) > launch_grace
+
+                # Hybrid fallback: if no executor heartbeat exists yet, check native log / Presence API
+                if check_method == "hybrid" and not proc_dead:
+                    log_in_game = bool(log_info and log_info.get("state") == "in_game")
+                    if log_in_game:
+                        self._set_state(status="RUNNING", consecutive_fails=0, last_event="log_in_game")
+                        if rejoin_min > 0 and (now - self.state.session_started_at) >= rejoin_min * 60.0:
+                            self.log(self.state.name, f"Scheduled rejoin after {rejoin_min:g}m")
+                            self._set_state(rejoin_count=self.state.rejoin_count + 1)
+                            self._launch("scheduled_rejoin")
+                        continue
+                    if grace_expired and not self.dry_run and self.cookie and self.state.user_id:
+                        if (now - self.last_presence_ts) >= max(15.0, float(self.profile.get("presence_poll_seconds") or 30)):
+                            self.last_presence_ts = now
+                            ptype, api_place, _ = check_presence(self.state.user_id, self.cookie)
+                            if ptype == 2 and (not api_place or not self.target_place_id or int(api_place) == int(self.target_place_id)):
+                                self._set_state(status="RUNNING", consecutive_fails=0, last_event="hybrid_presence_ok")
+                                continue
+
                 if proc_dead or grace_expired:
                     why = "process_died" if proc_dead else "launch_grace_expired"
                     if proc_dead and self.mgr.config.get("kill_all_on_crash"):
@@ -1138,7 +1279,19 @@ class InstanceWorker(threading.Thread):
 
 
 class Manager:
-    def __init__(self, config, store, logger, ipc_sock_path=None, enable_ipc=False, change_config_path=None):
+    def __init__(
+        self,
+        config,
+        store,
+        logger,
+        ipc_sock_path=None,
+        enable_ipc=False,
+        change_config_path=None,
+        enable_web=None,
+        web_host=None,
+        web_port=None,
+        web_token=None,
+    ):
         self.config = config
         self.store = store
         self.logger = logger
@@ -1154,6 +1307,12 @@ class Manager:
         self.enable_ipc = bool(enable_ipc or ipc_sock_path)
         self.ipc_sock_path = ipc_sock_path or DEFAULT_IPC_SOCK
         self._ipc = None
+        self.log_watcher = BatchLogWatcher()
+        self.enable_web = bool(config.get("web_enabled", False)) if enable_web is None else bool(enable_web)
+        self.web_host = web_host or config.get("web_host") or "127.0.0.1"
+        self.web_port = int(web_port if web_port is not None else (config.get("web_port") or 8787))
+        self.web_token = config.get("web_token", "") if web_token is None else str(web_token)
+        self.web_panel = None
 
     def start(self, instance_names=None, dry_run=False, profile_override=None):
         self.stop_event.clear()
@@ -1192,6 +1351,18 @@ class Manager:
                 },
                 "reload_config": lambda _a: self.reload_config(),
                 "rotate": lambda a: {"rotated": self.force_rotate(a.get("instance", ""), a.get("reason", "ipc"))},
+                "rejoin": lambda a: {"rejoined": self.force_rejoin(a.get("instance", "all"), a.get("reason", "ipc"))},
+                "inject_cookies": lambda a: {"added": self.store.add_cookies(str(a.get("text") or "")), "counts": self.store.counts()},
+                "clean_ram": lambda _a: {"ok": su("am kill-all", 15)[0] == 0},
+                "optimize_cloud": lambda _a: optimize_cloud_device([w.state.package for w in self.workers.values()]),
+                "sync_download": lambda _a: {
+                    "mirrored": mirror_outputs_to_download(
+                        self.store,
+                        self.change_config_path,
+                        hub_dir=self.config.get("download_hub_dir") or DEFAULT_HUB_DIR,
+                    )
+                },
+                "set_links": self._ipc_set_links,
                 "sort_tabs": lambda a: {
                     "resized": sort_roblox_tabs(
                         [w.state.package for w in self.workers.values()],
@@ -1203,6 +1374,19 @@ class Manager:
             self._ipc = IPCServer(self.ipc_sock_path, handlers=handlers)
             self._ipc.start()
 
+        if self.enable_web:
+            self.web_panel = WebPanelServer(
+                host=self.web_host,
+                port=self.web_port,
+                token=self.web_token,
+                manager=self,
+                store=self.store,
+                change_config_path=self.change_config_path,
+                ipc_sock_path=self.ipc_sock_path,
+            )
+            url = self.web_panel.start()
+            self.logger("WEB", f"Web Control Panel listening at {url}")
+
         self._maint_thread = threading.Thread(
             target=self._maintenance_loop,
             args=(dry_run,),
@@ -1210,6 +1394,19 @@ class Manager:
             name="mgr-maintenance",
         )
         self._maint_thread.start()
+
+    def _ipc_set_links(self, args):
+        inst = str(args.get("instance") or "all").strip()
+        target = str(args.get("target") or "").strip()
+        cfg = load_config()
+        updated = 0
+        for row in cfg.get("instances") or []:
+            if inst == "all" or row.get("name") == inst or row.get("package") == inst:
+                row["target"] = target
+                updated += 1
+        save_config(cfg)
+        self.reload_config()
+        return {"updated": updated}
 
     def _recent_logs(self, n=20):
         with self.logger.lock:
@@ -1252,18 +1449,49 @@ class Manager:
         last_sort = 0.0
         last_proc = 0.0
         last_block = 0.0
+        last_anr = 0.0
+        last_hub = 0.0
         while not self.stop_event.wait(5.0):
             now = time.time()
 
-            # Batched /proc PID + VmRSS telemetry across all worker packages (1 su call)
+            # Batched /proc PID + VmRSS telemetry + native Roblox log tail watcher
             if not dry_run and (now - last_proc) >= 5.0:
                 last_proc = now
                 pkgs = [w.state.package for w in self.workers.values() if w.state.package]
                 usage = get_batch_pkg_usage(pkgs)
+                min_mtimes = {
+                    w.state.package: max(0.0, w.launch_ts - 2.0)
+                    for w in self.workers.values()
+                    if w.state.package
+                }
+                log_states = self.log_watcher.poll_packages(pkgs, min_mtime_map=min_mtimes)
                 for w in self.workers.values():
                     u = usage.get(w.state.package)
                     if u:
                         w._set_state(pid=u.get("pid"), ram_mb=u.get("mem_mb"))
+                    lg = log_states.get(w.state.package)
+                    if lg:
+                        w.update_log_state(lg)
+
+            # ANR / Crash dialog watchdog every 15s
+            if not dry_run and self.config.get("auto_dismiss_anr", True) and (now - last_anr) >= 15.0:
+                last_anr = now
+                pkgs = [w.state.package for w in self.workers.values() if w.state.package]
+                anr_pkgs = detect_anr_or_crash_packages(pkgs)
+                if anr_pkgs:
+                    for w in self.workers.values():
+                        if w.state.package in anr_pkgs:
+                            self.logger(w.state.name, "ANR/Crash dialog detected; scheduling restart")
+                            w.request_rejoin("anr_detected")
+
+            # Download hot-folder cookie ingest & output mirror every 5s
+            if not dry_run and self.config.get("download_hub_sync", True) and (now - last_hub) >= 5.0:
+                last_hub = now
+                hub_dir = self.config.get("download_hub_dir") or DEFAULT_HUB_DIR
+                added = ingest_hot_cookies(self.store, hub_dir=hub_dir)
+                if added > 0:
+                    self.logger("HUB", f"Ingested {added} hot cookie(s) from Download drop folder")
+                mirror_outputs_to_download(self.store, self.change_config_path, hub_dir=hub_dir)
 
             # Cross-block active accounts so clones split onto distinct public servers
             if not dry_run and self.config.get("auto_block_accounts") and (now - last_block) >= 20.0:
@@ -1365,6 +1593,9 @@ class Manager:
 
     def stop(self, timeout=10):
         self.stop_event.set()
+        if self.web_panel:
+            self.web_panel.stop()
+            self.web_panel = None
         if self._ipc:
             self._ipc.stop()
             self._ipc = None
@@ -1376,9 +1607,30 @@ class Manager:
     def snapshot(self):
         return [w.snapshot() for w in self.workers.values()]
 
+    def active_job_ids(self, exclude=None):
+        jobs = set()
+        for name, w in self.workers.items():
+            if exclude and name == exclude:
+                continue
+            jid = w.state.current_job_id
+            if jid:
+                jobs.add(jid)
+        return jobs
+
     def force_rotate(self, inst_name, reason="manual"):
         w = self.workers.get(inst_name)
         if w:
             w.request_rotate(reason)
+            return True
+        return False
+
+    def force_rejoin(self, inst_name="all", reason="manual"):
+        if not inst_name or inst_name == "all":
+            for w in self.workers.values():
+                w.request_rejoin(reason)
+            return bool(self.workers)
+        w = self.workers.get(inst_name)
+        if w:
+            w.request_rejoin(reason)
             return True
         return False

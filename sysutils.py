@@ -212,7 +212,7 @@ def _inspect_executor_root(root_path, label_hint=None):
 
 
 def scan_executor_dirs(pkg=None, sdcard_root="/storage/emulated/0"):
-    """Discover Delta / Codex / Arceus / Fluxus / Cryptic / custom executor directories."""
+    """Discover Delta / Codex / Arceus / Fluxus / Cryptic / RejoinTool / custom executor directories."""
     found = []
     seen_roots = set()
 
@@ -242,6 +242,10 @@ def scan_executor_dirs(pkg=None, sdcard_root="/storage/emulated/0"):
                         _add(_inspect_executor_root(sub.path, f"{pkg}/{sub.name}"))
             except OSError:
                 pass
+        if sdcard_root == "/storage/emulated/0":
+            priv_exe = f"/data/data/{pkg}/files/exe"
+            if os.path.isdir(priv_exe):
+                _add(_inspect_executor_root(priv_exe, f"{pkg}/exe"))
 
     if not found:
         found.append({
@@ -251,6 +255,33 @@ def scan_executor_dirs(pkg=None, sdcard_root="/storage/emulated/0"):
             "workspace": DEFAULT_WORKSPACE,
         })
     return found
+
+
+def optimize_cloud_device(packages=None, disable_animations=True, whitelist_doze=True):
+    """Optimize Cloud Phone OS: disable UI animations, whitelist Termux/clones from Doze, and trim background apps."""
+    res = {"animations_disabled": False, "doze_whitelisted": 0, "trimmed": False}
+    if disable_animations:
+        rc, _, _ = su(
+            "settings put global window_animation_scale 0; "
+            "settings put global transition_animation_scale 0; "
+            "settings put global animator_duration_scale 0",
+            timeout=10,
+        )
+        res["animations_disabled"] = (rc == 0)
+
+    if whitelist_doze:
+        targets = ["com.termux", "com.termux.boot"]
+        for p in packages or []:
+            if p and p not in targets:
+                targets.append(p)
+        cmds = [f"dumpsys deviceidle whitelist +{shlex.quote(p)}" for p in targets]
+        rc_w, _, _ = su("; ".join(cmds), timeout=15)
+        if rc_w == 0:
+            res["doze_whitelisted"] = len(targets)
+
+    rc_k, _, _ = su("am kill-all", timeout=15)
+    res["trimmed"] = (rc_k == 0)
+    return res
 
 
 # ───────────────────────── window grid & tab sorter ─────────────────────────

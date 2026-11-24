@@ -7,6 +7,10 @@ extracted_cookies.txt
 state.json
 config.json
 passwords.db*
+template_cookies_v14.db*
+Cookies.template.db*
+.license.db
+.rejoin_ipc.sock
 switched/
 .tmp/
 logs/

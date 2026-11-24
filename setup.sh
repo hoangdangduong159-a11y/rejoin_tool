@@ -1,8 +1,8 @@
 #!/data/data/com.termux/files/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-#  Rejoin Tool v3.0 Hybrid — QUICK SETUP 1 lệnh (theo kiểu QH Rejoin)
+#  Rejoin Tool v4.0 Ultra — QUICK SETUP 1 lệnh (Hybrid + Web Panel + Hot-Folder)
 #
-#  Cài online (sau khi push repo lên GitHub, sửa DEFAULT_REPO bên dưới):
+#  Cài online:
 #     . <(curl -sL https://raw.githubusercontent.com/hoangdangduong159-a11y/rejoin_tool/main/setup.sh)
 #
 #  Cài / cài lại từ thư mục local có sẵn:

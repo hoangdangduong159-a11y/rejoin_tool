@@ -24,6 +24,8 @@ local GuiService = game:GetService("GuiService")
 local CoreGui = game:GetService("CoreGui")
 local VirtualUser = game:GetService("VirtualUser")
 local TeleportService = game:GetService("TeleportService")
+local StatsService = game:GetService("Stats")
+local RunService = game:GetService("RunService")
 
 if genv._RejoinFpsCap and setfpscap then
     pcall(setfpscap, genv._RejoinFpsCap)
@@ -52,10 +54,37 @@ local state = {
     stats = {},
 }
 
+local smoothedFps = 0
+pcall(function()
+    RunService.RenderStepped:Connect(function(dt)
+        if dt and dt > 0 then
+            smoothedFps = math.floor(1 / dt + 0.5)
+        end
+    end)
+end)
+
+local function readPingMs()
+    local pingVal = 0
+    pcall(function()
+        local net = StatsService and StatsService:FindFirstChild("Network")
+        local ssi = net and net:FindFirstChild("ServerStatsItem")
+        local dp = ssi and ssi:FindFirstChild("Data Ping")
+        if dp and dp.GetValue then
+            pingVal = math.floor(tonumber(dp:GetValue()) or 0)
+        end
+    end)
+    return pingVal
+end
+
 local function writeHeartbeat()
+    local playersCount = 0
+    pcall(function()
+        playersCount = #Players:GetPlayers()
+    end)
     local payload = {
         time = os.time(),
         placeId = game.PlaceId,
+        placeVersion = game.PlaceVersion,
         jobId = game.JobId,
         userId = player.UserId,
         username = player.Name,
@@ -64,6 +93,9 @@ local function writeHeartbeat()
         kicked = state.kicked,
         kickMsg = state.kickMsg,
         antiAfk = state.antiAfk,
+        fps = smoothedFps,
+        ping = readPingMs(),
+        playersCount = playersCount,
         stats = state.stats,
     }
     pcall(function()

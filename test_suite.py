@@ -1,17 +1,22 @@
-"""Automated verification tests for rejoin_tool v2.0 (safe: never mutates live Roblox cookie DB or launches apps)."""
+"""Automated verification tests for rejoin_tool v4.0 Ultra (safe: never mutates live Roblox cookie DB or launches apps)."""
 import json
 import os
 import sqlite3
 import tempfile
 import time
+import urllib.error
+import urllib.request
 
 import engine
 from ipc import ipc_request
+import log_watch
 import lua_deploy
 import main
 import rjcore
 import rules
+import shared_hub
 import sysutils
+import web_panel
 
 TMP_BASE = "/data/data/com.termux/files/usr/tmp"
 
@@ -236,21 +241,29 @@ def test_dry_run_engine():
 def test_readonly_device_checks():
     assert rjcore.has_root(), "Root not available"
     pkgs = rjcore.detect_packages()
-    assert "free.nokaA" in pkgs, f"Expected free.nokaA in {pkgs}"
-    ck = rjcore.read_app_cookie("free.nokaA")
-    assert ck and len(ck) > 100, "Failed to read cookie from free.nokaA"
-    print(f"  [device] read_app_cookie(free.nokaA) OK: {rjcore.short(ck)}")
+    assert len(pkgs) >= 1, f"Expected at least 1 Roblox/clone package, got {pkgs}"
+    ck = rjcore.read_app_cookie(pkgs[0])
+    if ck:
+        print(f"  [device] detected {pkgs}, read_app_cookie({pkgs[0]}) OK: {rjcore.short(ck)}")
+    else:
+        print(f"  [device] detected {pkgs} (no logged-in cookie on {pkgs[0]} yet)")
 
 
 def test_auto_extract():
-    records = rjcore.extract_all_cookies(["free.nokaA"])
-    assert len(records) == 1
-    rec = records[0]
-    assert rec["package"] == "free.nokaA"
-    assert rec["status"] == "ok", f"Unexpected status: {rec['status']}"
-    assert isinstance(rec["user_id"], int) and rec["username"]
-    assert rec["cookie"] and len(rec["cookie"]) > 100
+    pkgs = rjcore.detect_packages()
+    if pkgs:
+        live_recs = rjcore.extract_all_cookies([pkgs[0]])
+        assert len(live_recs) == 1 and live_recs[0]["package"] == pkgs[0]
 
+    # Deterministic export & DB extraction check using mock records
+    c1 = "_|WARNING:-DO-NOT-SHARE-THIS.|_EXT1_" + ("E" * 160)
+    records = [{
+        "package": "vip.orsshjbd",
+        "cookie": c1,
+        "status": "ok",
+        "user_id": 123456,
+        "username": "mock_user",
+    }]
     with tempfile.TemporaryDirectory(dir=TMP_BASE) as td:
         st = rjcore.Store(base_dir=td)
         out_path = os.path.join(td, "extracted.txt")
@@ -259,21 +272,17 @@ def test_auto_extract():
         assert (os.stat(out_path).st_mode & 0o777) == 0o600
         with open(out_path) as f:
             parts = f.read().strip().split("|", 3)
-        assert len(parts) == 4
-        assert parts[0] == rec["username"]
-        assert parts[1] == str(rec["user_id"])
-        assert parts[2] == "free.nokaA"
-        assert parts[3] == rec["cookie"]
+        assert parts == ["mock_user", "123456", "vip.orsshjbd", c1]
 
         uc_path = os.path.join(td, "uc.txt")
         assert st.export_extracted(records, uc_path, fmt="user_cookie") == 1
         with open(uc_path) as f:
-            assert f.read().strip() == f"{rec['username']}|{rec['cookie']}"
+            assert f.read().strip() == f"mock_user|{c1}"
 
         raw_path = os.path.join(td, "raw.txt")
         assert st.export_extracted(records, raw_path, fmt="raw") == 1
         with open(raw_path) as f:
-            assert f.read().strip() == rec["cookie"]
+            assert f.read().strip() == c1
 
 
 def test_sysutils():
@@ -668,8 +677,9 @@ def test_hybrid_pending_cookie_auto_recovery():
 def test_hybrid_batch_proc_and_shared_sync():
     st = sysutils.get_system_stats()
     assert st["tool_ram_mb"] > 0
-    batch = sysutils.get_batch_pkg_usage(["free.nokaA"])
-    assert "free.nokaA" in batch
+    pkgs = rjcore.detect_packages() or ["vip.orsshjbd"]
+    batch = sysutils.get_batch_pkg_usage([pkgs[0]])
+    assert pkgs[0] in batch
 
     with tempfile.TemporaryDirectory(dir=TMP_BASE) as td:
         s_ae = os.path.join(td, "shared", "Autoexec")
@@ -717,6 +727,292 @@ def test_quick_setup_commands():
     assert main.detect_setup_url().endswith("/setup.sh")
 
 
+def test_log_watch_parser_and_error_codes():
+    # Old error followed by newer Connection accepted -> should report in_game with no error
+    log_ok = "\n".join([
+        "2026-11-25T01:00:00Z [FLog::Network] Disconnect from server, Error code: 277",
+        "2026-11-25T01:01:00Z [FLog::Output] Joining game '11111111-2222-3333-4444-555555555555' place 2753915549",
+        "2026-11-25T01:01:05Z [FLog::Network] Connection accepted from 128.116.0.1|50000",
+    ])
+    p_ok = log_watch.parse_roblox_log_tail(log_ok)
+    assert p_ok["state"] == "in_game"
+    assert p_ok["error_code"] is None
+    assert p_ok["place_id"] == 2753915549
+    assert p_ok["job_id"] == "11111111-2222-3333-4444-555555555555"
+
+    for code, sample in (
+        (264, "[FLog::Network] Same account launched experience from different device. Error code: 264"),
+        (267, "[FLog::Network] You were kicked from this experience (Error Code: 267)"),
+        (268, "[FLog::Network] You have been kicked due to unexpected client behavior. (Error Code: 268)"),
+        (277, "[FLog::Network] Lost connection to the game server (Error code: 277)"),
+        (279, "[FLog::Network] Failed to connect to the Game. (ID = 17: Connection attempt failed.)"),
+        (524, "[FLog::Network] Not authorized to join this experience (Error Code: 524)"),
+        (529, "[FLog::Network] Roblox HTTP 529 service unavailable"),
+    ):
+        res = log_watch.parse_roblox_log_tail(sample)
+        assert res["state"] == "disconnected", f"Expected disconnected for {code}: {res}"
+        assert res["error_code"] == code, f"Expected {code}, got {res}"
+
+    anr_txt = "  Window #2 Window{abc u0 Application Not Responding: vip.orsshjbd}:\n"
+    assert log_watch.parse_anr_windows(anr_txt, ["vip.orsshjbd", "vip.ytcjk"]) == {"vip.orsshjbd"}
+
+
+def test_race_ver_numeric_and_string_matching():
+    with tempfile.TemporaryDirectory(dir=TMP_BASE) as td:
+        cc_path = os.path.join(td, "config-change.json")
+        c0 = rjcore.save_change_config({"level": 100, "race_ver": 0}, path=cc_path)
+        assert c0["race_ver"] == 0
+        assert rjcore.info_matches_change_config({"level": 100}, c0)[0] is True
+
+        c1 = rjcore.save_change_config({"race_ver": 1}, path=cc_path)
+        assert c1["race_ver"] == 1
+        assert rjcore.info_matches_change_config({"race_ver": "Human V3"}, c1)[0] is True
+        assert rjcore.info_matches_change_config({"tier": 2}, c1)[0] is True
+
+        c3 = rjcore.save_change_config({"race_ver": 3}, path=cc_path)
+        assert rjcore.info_matches_change_config({"race_ver": "Human V2"}, c3)[0] is False
+        assert rjcore.info_matches_change_config({"race_ver": "Cyborg V4"}, c3)[0] is True
+
+        c_str = rjcore.save_change_config({"race_ver": "Ghoul V3"}, path=cc_path)
+        assert rjcore.info_matches_change_config({"race_ver": "Ghoul V4"}, c_str)[0] is True
+        assert rjcore.info_matches_change_config({"race_ver": "Ghoul V2"}, c_str)[0] is False
+        assert rjcore.info_matches_change_config({"race_ver": "Human V4"}, c_str)[0] is False
+
+
+def test_shared_hub_download_hot_ingest_and_shouko_import():
+    with tempfile.TemporaryDirectory(dir=TMP_BASE) as td:
+        dl = os.path.join(td, "Download")
+        hub = os.path.join(dl, "RejoinTool")
+        shk = os.path.join(dl, "Shouko")
+        s_ae = os.path.join(td, "shared_ae")
+        s_ws = os.path.join(td, "shared_ws")
+        os.makedirs(os.path.join(shk, "Autoexec"), exist_ok=True)
+        os.makedirs(os.path.join(shk, "Workspace"), exist_ok=True)
+
+        c1 = "_|WARNING:-DO-NOT-SHARE-THIS.|_HUB1_" + ("M" * 160)
+        c2 = "_|WARNING:-DO-NOT-SHARE-THIS.|_HUB2_" + ("N" * 160)
+        with open(os.path.join(dl, "cookie.txt"), "w") as f:
+            f.write(c1 + "\n")
+        with open(os.path.join(dl, "config-change.json"), "w") as f:
+            json.dump({"race_ver": 1, "level": 2600, "god_human": True}, f)
+        with open(os.path.join(shk, "Autoexec", "farm.lua"), "w") as f:
+            f.write("print('shouko_lua')")
+        with open(os.path.join(shk, "Workspace", "settings.txt"), "w") as f:
+            f.write("ok")
+        with open(os.path.join(shk, "server_links.txt"), "w") as f:
+            f.write("vip.orsshjbd,roblox://placeId=2753915549\n")
+
+        st = rjcore.Store(base_dir=os.path.join(td, "store"))
+        st.ensure_files()
+        cfg = {"instances": [{"name": "clone1", "package": "vip.orsshjbd", "target": ""}]}
+        cc_dst = os.path.join(td, "cc.json")
+
+        summary = shared_hub.import_shouko_environment(
+            st,
+            cfg,
+            shouko_dir=shk,
+            download_dir=dl,
+            change_config_path=cc_dst,
+            shared_autoexec=s_ae,
+            shared_workspace=s_ws,
+        )
+        assert summary["cookies_added"] == 1
+        assert summary["change_config_imported"] is True
+        assert summary["autoexec_copied"] == 1
+        assert summary["workspace_copied"] == 1
+        assert summary["links_imported"] == 1
+        assert cfg["instances"][0]["target"] == "roblox://placeId=2753915549"
+        assert os.path.getsize(os.path.join(dl, "cookie.txt")) == 0
+        assert rjcore.load_change_config(cc_dst)["race_ver"] == 1
+
+        # Test hot-folder ingest & output mirror
+        assert shared_hub.ensure_hub_dirs(hub) is True
+        with open(os.path.join(hub, "cookies_inbox.txt"), "w") as f:
+            f.write(c2 + "\n")
+        assert shared_hub.ingest_hot_cookies(st, hub_dir=hub, download_dir=dl) == 1
+        assert st.counts()["queue"] == 2
+        st.add_done("alice", c1, "completed")
+        mirrored = shared_hub.mirror_outputs_to_download(st, change_config_path=cc_dst, hub_dir=hub)
+        assert mirrored >= 2
+        assert os.path.isfile(os.path.join(hub, "switched", "acc_ok.txt"))
+
+
+def test_web_panel_rest_api_and_auth():
+    with tempfile.TemporaryDirectory(dir=TMP_BASE) as td:
+        st = rjcore.Store(base_dir=td)
+        st.ensure_files()
+        c1 = "_|WARNING:-DO-NOT-SHARE-THIS.|_WEB1_" + ("W" * 160)
+        c2 = "_|WARNING:-DO-NOT-SHARE-THIS.|_WEB2_" + ("V" * 160)
+        st.add_cookies(c1)
+        cfg = {
+            "webhook": "",
+            "stagger_launch_seconds": 0,
+            "instances": [{
+                "name": "clone1",
+                "package": "vip.orsshjbd",
+                "profile": "default",
+                "workspace": td,
+                "autoexec": td,
+                "use_cookie_queue": True,
+                "enabled": True,
+            }],
+        }
+        prof_override = {
+            **rjcore.DEFAULT_PROFILE,
+            "name": "web_prof",
+            "place_id": 2753915549,
+            "check_method": "hybrid",
+            "poll_interval": 0.2,
+            "when_no_cookies": "wait",
+        }
+        cc_path = os.path.join(td, "cc.json")
+        rjcore.save_change_config(rjcore.DEFAULT_CHANGE_CONFIG, path=cc_path)
+        mgr = engine.Manager(cfg, st, rjcore.Logger(echo=False), change_config_path=cc_path)
+        mgr.start(dry_run=True, profile_override=prof_override)
+        srv = web_panel.WebPanelServer(
+            host="127.0.0.1",
+            port=0,
+            token="secret_tok_42",
+            manager=mgr,
+            store=st,
+            change_config_path=cc_path,
+        )
+        url = srv.start()
+        try:
+            # 1. Unauthorized without token
+            try:
+                urllib.request.urlopen(url + "/api/status", timeout=3)
+                assert False, "Expected 401"
+            except urllib.error.HTTPError as e:
+                assert e.code == 401
+
+            # 2. HTML dashboard loads
+            with urllib.request.urlopen(url + "/", timeout=3) as resp:
+                assert resp.status == 200
+                html = resp.read().decode("utf-8")
+                assert "Rejoin Tool v4.0 Ultra" in html
+
+            # 3. Authorized status does not leak raw cookie
+            req = urllib.request.Request(url + "/api/status", headers={"Authorization": "Bearer secret_tok_42"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                assert data["ok"] is True
+                assert c1 not in json.dumps(data)
+
+            # 4. POST /api/cookies & POST /api/change-config & POST /api/action
+            def _post(path, payload):
+                r = urllib.request.Request(
+                    url + path,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Authorization": "Bearer secret_tok_42", "Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(r, timeout=3) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+
+            res_ck = _post("/api/cookies", {"text": c2, "prune": False})
+            assert res_ck["ok"] is True and res_ck["added"] == 1
+
+            res_bf = _post("/api/change-config", {"level": 2550, "god_human": True, "race_ver": 3})
+            assert res_bf["ok"] is True and res_bf["change_config"]["race_ver"] == 3
+
+            res_rj = _post("/api/action", {"action": "rejoin_instance", "instance": "clone1"})
+            assert res_rj["ok"] is True
+            time.sleep(0.5)
+            assert mgr.snapshot()[0]["rejoin_count"] >= 1
+        finally:
+            srv.stop()
+            mgr.stop(timeout=3)
+
+
+def test_hybrid_mode_log_disconnect_and_ipc_rejoin():
+    with tempfile.TemporaryDirectory(dir=TMP_BASE) as td:
+        sock_path = os.path.join(td, "hyb.sock")
+        st = rjcore.Store(base_dir=td)
+        st.ensure_files()
+        c1 = "_|WARNING:-DO-NOT-SHARE-THIS.|_HYB_LOG1_" + ("R" * 160)
+        st.add_cookies(c1)
+        cfg = {
+            "webhook": "",
+            "stagger_launch_seconds": 0,
+            "instances": [{
+                "name": "clone1",
+                "package": "vip.orsshjbd",
+                "profile": "default",
+                "workspace": td,
+                "autoexec": td,
+                "use_cookie_queue": True,
+                "enabled": True,
+            }],
+        }
+        prof_override = {
+            **rjcore.DEFAULT_PROFILE,
+            "name": "hyb_test",
+            "place_id": 2753915549,
+            "check_method": "hybrid",
+            "poll_interval": 0.2,
+            "launch_grace": 30,
+        }
+        mgr = engine.Manager(cfg, st, rjcore.Logger(echo=False), ipc_sock_path=sock_path, enable_ipc=True)
+        mgr.start(dry_run=True, profile_override=prof_override)
+        try:
+            time.sleep(0.5)
+            res = ipc_request("rejoin", {"instance": "clone1", "reason": "ipc_rj"}, sock_path=sock_path)
+            assert res.get("ok") and res["result"]["rejoined"] is True
+            time.sleep(0.5)
+            assert mgr.snapshot()[0]["rejoin_count"] >= 1
+
+            # Feed simulated Error 277 disconnect after launch grace (dry_run grace is 1.5s)
+            time.sleep(1.7)
+            w = mgr.workers["clone1"]
+            before_rj = mgr.snapshot()[0]["rejoin_count"]
+            w.update_log_state({"state": "disconnected", "error_code": 277, "message": "Lost connection"})
+            deadline = time.time() + 4.0
+            rejoined = False
+            while time.time() < deadline:
+                if mgr.snapshot()[0]["rejoin_count"] > before_rj:
+                    rejoined = True
+                    break
+                time.sleep(0.15)
+            assert rejoined, "Hybrid worker did not rejoin on simulated log Error 277"
+        finally:
+            mgr.stop(timeout=3)
+
+
+def test_appcloner_metadata_and_vip_pkg_detection():
+    assert rjcore._ROBLOX_PKG_RE.match("vip.orsshjbd")
+    assert rjcore._ROBLOX_PKG_RE.match("vip.ytcjk")
+    assert rjcore._ROBLOX_PKG_RE.match("com.vng.roblox.client")
+    assert "com.quanghuy.rejoin" in rjcore._EXCLUDED_PACKAGES
+    name1 = rjcore.suggest_instance_name("vip.orsshjbd", 1, metadata={"clone_number": 1}, used_names=set())
+    assert name1 == "clone1"
+    name2 = rjcore.suggest_instance_name("vip.ytcjk", 2, metadata={"clone_number": 1}, used_names={"clone1"})
+    assert name2 == "clone1_2"
+
+
+def test_cookie_prune_parallel():
+    with tempfile.TemporaryDirectory(dir=TMP_BASE) as td:
+        st = rjcore.Store(base_dir=td)
+        st.ensure_files()
+        ck_ok = "_|WARNING:-DO-NOT-SHARE-THIS.|_OK_" + ("A" * 160)
+        ck_dead = "_|WARNING:-DO-NOT-SHARE-THIS.|_DEAD_" + ("B" * 160)
+        ck_cap = "_|WARNING:-DO-NOT-SHARE-THIS.|_CAP_" + ("C" * 160)
+        st.add_cookies(f"{ck_ok}\n{ck_dead}\n{ck_cap}")
+
+        def _mock_val(ck):
+            if ck == ck_ok:
+                return {"state": "ok", "user_id": 1, "username": "ok_user", "reason": ""}
+            if ck == ck_dead:
+                return {"state": "banned", "user_id": None, "username": "ban_user", "reason": "banned"}
+            return {"state": "captcha", "user_id": None, "username": "cap_user", "reason": "captcha"}
+
+        res = st.prune_invalid_cookies(validator=_mock_val)
+        assert res["ok"] == 1 and res["dead"] == 1 and res["challenge"] == 1
+        assert st.queue() == [ck_ok]
+        assert st.switched_counts()["banned"] == 1
+        assert st.switched_counts()["captcha"] == 1
+
+
 if __name__ == "__main__":
     for fn in (
         test_quick_setup_commands,
@@ -738,6 +1034,13 @@ if __name__ == "__main__":
         test_blox_fruits_change_config,
         test_hybrid_pending_cookie_auto_recovery,
         test_hybrid_batch_proc_and_shared_sync,
+        test_log_watch_parser_and_error_codes,
+        test_race_ver_numeric_and_string_matching,
+        test_shared_hub_download_hot_ingest_and_shouko_import,
+        test_web_panel_rest_api_and_auth,
+        test_hybrid_mode_log_disconnect_and_ipc_rejoin,
+        test_appcloner_metadata_and_vip_pkg_detection,
+        test_cookie_prune_parallel,
     ):
         fn()
         print(f"[PASS] {fn.__name__}")

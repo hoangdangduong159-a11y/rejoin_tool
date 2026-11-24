@@ -1,7 +1,8 @@
-# ⚡ Hướng dẫn Setup nhanh — Rejoin Tool v3.0 Hybrid
+# ⚡ Hướng dẫn Setup nhanh — Rejoin Tool v4.0 Ultra
 
 > Chỉ cần copy-paste lệnh, không phải tạo file thủ công.
 > Trên máy đã cài, gõ `rejoin commands` để in lại toàn bộ các lệnh này.
+> Hỗ trợ **Web Dashboard (`:8787`)**, **Hot-Folder `/storage/emulated/0/Download/RejoinTool/`** và **di chuyển dữ liệu từ Shouko (`rejoin hub import-shouko`)**.
 
 ---
 
@@ -103,12 +104,18 @@ rejoin boot status
 ## 5. Các lệnh hay dùng sau khi setup
 
 ```bash
-rejoin                         # Menu tương tác
+rejoin                         # Menu tương tác v4.0 Ultra
 rejoin commands                # In lại toàn bộ lệnh setup/run/boot/stop
 rejoin quick-setup 2753915549  # Quét clone + gán link + deploy Lua (chạy lại khi thêm clone)
+rejoin web start               # Mở Web Control Panel tại http://127.0.0.1:8787
+rejoin hub import-shouko       # Nhập config-change.json, cookie.txt, Autoexec từ Download/Shouko
+rejoin hub sync                # Đồng bộ cookie.txt & switched/*.txt ra Download/RejoinTool
 rejoin cookies add -f /sdcard/Download/cookie.txt   # Nạp cookie vào hàng đợi
+rejoin cookies validate --clean                     # Lọc song song cookie chết/banned/captcha
+rejoin optimize --cloud-tune --fps 15               # Tối ưu Cloud Phone + giới hạn 15 FPS
+rejoin logs                    # Xem log kết nối & mã lỗi native (264/268/277/279...)
 rejoin status                  # Trạng thái instance, CPU/RAM, cookie
-rejoin config                  # Bảng cấu hình kiểu Shouko
+rejoin config                  # Bảng cấu hình v4.0
 ```
 
 ---

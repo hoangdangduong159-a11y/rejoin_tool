@@ -1,4 +1,4 @@
-"""Interactive Rich menu/dashboard + Headless CLI + Daemon/IPC client for multi-instance Roblox Auto-Rejoin v2."""
+"""Interactive Rich menu/dashboard + Headless CLI + Daemon/IPC + Web Panel client for multi-instance Roblox Auto-Rejoin v4.0 Ultra."""
 import argparse
 import json
 import os
@@ -18,6 +18,7 @@ from rich.table import Table
 
 from engine import Manager
 from ipc import DEFAULT_IPC_SOCK, ipc_request
+from log_watch import BatchLogWatcher
 from lua_deploy import HEARTBEAT_FILENAME, deploy_all_executors, deploy_heartbeat
 from rjcore import (
     BASE,
@@ -45,13 +46,25 @@ from rjcore import (
     logout_package,
     parse_target,
     read_app_cookie,
+    read_clone_metadata,
     save_change_config,
     save_config,
     save_json,
     short,
     su,
+    suggest_instance_name,
+    validate_cookies_parallel,
     whoami,
     write_app_cookie,
+)
+from shared_hub import (
+    DEFAULT_DOWNLOAD_DIR,
+    DEFAULT_HUB_DIR,
+    DEFAULT_SHOUKO_DIR,
+    ensure_hub_dirs,
+    import_shouko_environment,
+    ingest_hot_cookies,
+    mirror_outputs_to_download,
 )
 from sysutils import (
     GoFileDownloader,
@@ -64,12 +77,14 @@ from sysutils import (
     get_system_stats,
     kill_all_packages,
     list_autoexec_scripts,
+    optimize_cloud_device,
     scan_executor_dirs,
     send_discord_embed,
     set_stay_awake,
     sort_roblox_tabs,
     toggle_autoexec_script,
 )
+from web_panel import WebPanelServer
 
 console = Console()
 
@@ -86,8 +101,10 @@ def bootstrap():
     if not os.path.exists(CONFIG):
         pkgs = detect_packages() or ["free.nokaA"]
         instances = []
+        used_names = set()
         for i, pkg in enumerate(pkgs, 1):
-            name = f"noka{i}" if "noka" in pkg.lower() else f"inst{i}"
+            name = suggest_instance_name(pkg, i, used_names=used_names)
+            used_names.add(name)
             instances.append({
                 "name": name,
                 "package": pkg,
@@ -213,17 +230,26 @@ def cmd_detect(args):
     table = Table(title="Detected Roblox / Executor Packages", box=box.ROUNDED)
     table.add_column("#", justify="right", style="cyan")
     table.add_column("Package", style="bold green")
+    table.add_column("Clone Info", style="dim")
+    metas = {}
     for idx, p in enumerate(pkgs, 1):
-        table.add_row(str(idx), p)
+        meta = read_clone_metadata(p)
+        metas[p] = meta
+        info = meta.get("app_name") or "-"
+        if meta.get("clone_number"):
+            info = f"#{meta['clone_number']} {info}".strip()
+        table.add_row(str(idx), p, info)
     console.print(table)
 
     if args.add:
         existing = {i["package"] for i in cfg["instances"]}
+        used_names = {i.get("name") for i in cfg["instances"] if i.get("name")}
         added = 0
         for p in pkgs:
             if p not in existing:
                 idx = len(cfg["instances"]) + 1
-                name = f"noka{idx}" if "noka" in p.lower() else f"inst{idx}"
+                name = suggest_instance_name(p, idx, metadata=metas.get(p), used_names=used_names)
+                used_names.add(name)
                 execs = scan_executor_dirs(pkg=p)
                 cfg["instances"].append({
                     "name": name,
@@ -338,11 +364,24 @@ def cmd_cookies(args):
         console.print(f"[green]Added {n} unique cookie(s) to cookies.txt[/green]")
         return 0
     if args.action == "validate":
+        if getattr(args, "clean", False):
+            res = store.prune_invalid_cookies(max_workers=8)
+            console.print(
+                f"[green]Pruned queue ({res['total']} checked):[/green] "
+                f"OK=[green]{res['ok']}[/] | Dead=[red]{res['dead']}[/] | "
+                f"Challenge=[yellow]{res['challenge']}[/] | Error={res['error']}"
+            )
+            return 0
         q = store.queue()
+        if not q:
+            console.print("[dim]Cookie queue is empty.[/dim]")
+            return 0
+        results = validate_cookies_parallel(q, max_workers=8)
         valid = 0
-        for ck in q:
-            st, _uid, uname = whoami(ck)
-            console.print(f"  {short(ck)} -> {st} ({uname or '-'})")
+        for r in results:
+            st = r["state"]
+            uname = r.get("username") or "-"
+            console.print(f"  {short(r['cookie'])} -> {st} ({uname})")
             if st == "ok":
                 valid += 1
         console.print(f"Valid: {valid}/{len(q)}")
@@ -540,6 +579,108 @@ def cmd_optimize(args):
         for p in pkgs:
             ok = apply_low_graphics(p, fps_cap=args.fps, low_quality=True)
             console.print(f"[{'green' if ok else 'red'}]Low-Graphics + FPS={args.fps}: {p} ({'OK' if ok else 'FAILED'})[/]")
+    if getattr(args, "cloud_tune", False):
+        res = optimize_cloud_device(pkgs)
+        console.print(
+            f"[green]Cloud Tune:[/green] animations_off={res['animations_disabled']} | "
+            f"doze_whitelisted={res['doze_whitelisted']} | trimmed={res['trimmed']}"
+        )
+    return 0
+
+
+def cmd_web(args):
+    cfg = load_config()
+    host = getattr(args, "host", None) or cfg.get("web_host") or "127.0.0.1"
+    port = int(getattr(args, "port", None) or cfg.get("web_port") or 8787)
+    token = getattr(args, "token", None)
+    if token is None:
+        token = cfg.get("web_token") or ""
+    if args.action in ("url", "status"):
+        ping = ipc_request("ping", timeout=1.0)
+        console.print(f"Web Panel URL: [cyan]http://{host}:{port}[/cyan] (auto-start={bool(cfg.get('web_enabled'))})")
+        console.print(f"Background Daemon: {'[green]RUNNING[/]' if ping.get('ok') else '[dim]STOPPED (standalone mode available)[/]'}")
+        return 0
+    if args.action == "start":
+        srv = WebPanelServer(host=host, port=port, token=token)
+        url = srv.start()
+        console.print(f"[green]Web Control Panel running at[/green] [bold cyan]{url}[/bold cyan] (Ctrl+C to stop)")
+        try:
+            while True:
+                time.sleep(1.0)
+        except KeyboardInterrupt:
+            pass
+        srv.stop()
+        console.print("[yellow]Web Control Panel stopped.[/yellow]")
+        return 0
+    return 0
+
+
+def cmd_hub(args):
+    cfg = load_config()
+    store = Store()
+    store.ensure_files()
+    hub_dir = cfg.get("download_hub_dir") or DEFAULT_HUB_DIR
+    if args.action == "sync":
+        ensure_hub_dirs(hub_dir)
+        added = ingest_hot_cookies(store, hub_dir=hub_dir)
+        mirrored = mirror_outputs_to_download(store, CHANGE_CONFIG, hub_dir=hub_dir)
+        console.print(f"[green]Hub Sync ({hub_dir}):[/green] ingested {added} cookie(s), mirrored {mirrored} file(s).")
+        return 0
+    if args.action == "import-shouko":
+        res = import_shouko_environment(store, cfg, shouko_dir=DEFAULT_SHOUKO_DIR, download_dir=DEFAULT_DOWNLOAD_DIR)
+        save_config(cfg)
+        ipc_request("reload_config", timeout=1.5)
+        tbl = Table(title="Shouko / Download Import Summary", box=box.ROUNDED)
+        tbl.add_column("Item", style="cyan")
+        tbl.add_column("Result", style="green")
+        tbl.add_row("Cookies imported", str(res["cookies_added"]))
+        tbl.add_row("config-change.json", "YES" if res["change_config_imported"] else "not found")
+        tbl.add_row("Autoexec Lua copied", str(res["autoexec_copied"]))
+        tbl.add_row("Workspace files copied", str(res["workspace_copied"]))
+        tbl.add_row("Server links imported", str(res["links_imported"]))
+        console.print(tbl)
+        return 0
+    if args.action == "status":
+        exists = os.path.isdir(hub_dir)
+        ck_drop = os.path.join(DEFAULT_DOWNLOAD_DIR, "cookie.txt")
+        console.print(Panel(
+            f"Hub Dir: [cyan]{hub_dir}[/] ({'[green]READY[/]' if exists else '[dim]MISSING[/]'})\n"
+            f"Hot Cookie Drop: [cyan]{ck_drop}[/] ({os.path.getsize(ck_drop) if os.path.isfile(ck_drop) else 0} B)\n"
+            f"Auto-Sync in Engine: {'[green]ON[/]' if cfg.get('download_hub_sync', True) else '[red]OFF[/]'}",
+            title="Download Hub Status",
+            border_style="cyan",
+        ))
+        return 0
+    return 0
+
+
+def cmd_logs(_args=None):
+    cfg = load_config()
+    pkgs = [i["package"] for i in cfg.get("instances", []) if i.get("package")] or detect_packages()
+    if not pkgs:
+        console.print("[yellow]No Roblox packages found.[/yellow]")
+        return 1
+    res = BatchLogWatcher().poll_packages(pkgs)
+    tbl = Table(title="Native Roblox Client Log Telemetry", box=box.ROUNDED)
+    tbl.add_column("Package", style="cyan")
+    tbl.add_column("State")
+    tbl.add_column("Err", justify="right")
+    tbl.add_column("Place ID", justify="right")
+    tbl.add_column("Job ID", style="dim")
+    tbl.add_column("Last Message", style="dim")
+    for p in pkgs:
+        d = res.get(p) or {}
+        st = d.get("state") or "no_recent_log"
+        col = "green" if st == "in_game" else ("yellow" if st == "joining" else ("red" if st == "disconnected" else "dim"))
+        tbl.add_row(
+            p,
+            f"[{col}]{st}[/{col}]",
+            str(d.get("error_code") or "-"),
+            str(d.get("place_id") or "-"),
+            (d.get("job_id") or "-")[:14],
+            (d.get("message") or "-")[:45],
+        )
+    console.print(tbl)
     return 0
 
 
@@ -615,15 +756,18 @@ def cmd_links(args):
         updated = 0
         added = 0
         by_pkg = {i["package"]: i for i in cfg["instances"] if i.get("package")}
+        used_names = {i.get("name") for i in cfg["instances"] if i.get("name")}
         for p, uri in imported.items():
             if p in by_pkg:
                 by_pkg[p]["target"] = uri
                 updated += 1
             else:
                 idx = len(cfg["instances"]) + 1
+                name = suggest_instance_name(p, idx, used_names=used_names)
+                used_names.add(name)
                 execs = scan_executor_dirs(pkg=p)
                 cfg["instances"].append({
-                    "name": f"noka{idx}" if "noka" in p.lower() else f"inst{idx}",
+                    "name": name,
                     "package": p,
                     "profile": "default",
                     "target": uri,
@@ -679,6 +823,12 @@ def cmd_daemon(args):
             run_cmd.extend(["--target", args.target])
         if getattr(args, "rejoin_min", None) is not None:
             run_cmd.extend(["--rejoin-min", str(args.rejoin_min)])
+        if getattr(args, "web", False):
+            run_cmd.append("--web")
+        if getattr(args, "web_port", None):
+            run_cmd.extend(["--web-port", str(args.web_port)])
+        if getattr(args, "web_host", None):
+            run_cmd.extend(["--web-host", str(args.web_host)])
         os.makedirs(LOGDIR, exist_ok=True)
         log_path = os.path.join(LOGDIR, "daemon.log")
         with open(log_path, "a") as lf:
@@ -792,6 +942,7 @@ def cmd_quick_setup(args):
 
     target = (getattr(args, "target", None) or "").strip()
     by_pkg = {i["package"]: i for i in cfg["instances"] if i.get("package")}
+    used_names = {i.get("name") for i in cfg["instances"] if i.get("name")}
     for p in pkgs:
         if p in by_pkg:
             by_pkg[p]["profile"] = prof_name
@@ -800,9 +951,11 @@ def cmd_quick_setup(args):
             by_pkg[p]["enabled"] = True
         else:
             idx = len(cfg["instances"]) + 1
+            name = suggest_instance_name(p, idx, used_names=used_names)
+            used_names.add(name)
             execs = scan_executor_dirs(pkg=p)
             cfg["instances"].append({
-                "name": f"noka{idx}" if "noka" in p.lower() else f"inst{idx}",
+                "name": name,
                 "package": p,
                 "profile": prof_name,
                 "target": target,
@@ -814,6 +967,14 @@ def cmd_quick_setup(args):
     save_config(cfg)
     ipc_request("reload_config", timeout=1.5)
 
+    hub_dir = cfg.get("download_hub_dir") or DEFAULT_HUB_DIR
+    ensure_hub_dirs(hub_dir)
+    store = Store()
+    store.ensure_files()
+    hot_added = ingest_hot_cookies(store, hub_dir=hub_dir)
+    if hot_added:
+        console.print(f"[green]Ingested {hot_added} cookie(s) from Download/cookie.txt.[/green]")
+
     extra_lua = None
     if prof.get("lua"):
         extra_lua = prof["lua"] if os.path.isabs(prof["lua"]) else os.path.join(PROFILES, "lua", prof["lua"])
@@ -824,7 +985,7 @@ def cmd_quick_setup(args):
     )
     console.print(f"[green]Quick Setup complete: {len(pkgs)} package(s), profile='{prof_name}', deployed {len(dep)} Lua/shared file(s).[/green]")
     if getattr(args, "start", False):
-        return cmd_run(argparse.Namespace(instance=None, profile=None, target=None, rejoin_min=None, dry_run=False, dashboard=True))
+        return cmd_run(argparse.Namespace(instance=None, profile=None, target=None, rejoin_min=None, dry_run=False, dashboard=True, web=bool(cfg.get("web_enabled")), web_port=None, web_host=None))
     console.print("[dim]Xem lệnh chạy root / Termux:Boot / Stop (kiểu QH Rejoin): rejoin commands[/dim]")
     return 0
 
@@ -1069,7 +1230,15 @@ def cmd_run(args):
     store = Store()
     from rjcore import Logger
     logger = Logger(echo=not args.dashboard)
-    mgr = Manager(cfg, store, logger, enable_ipc=not args.dry_run)
+    mgr = Manager(
+        cfg,
+        store,
+        logger,
+        enable_ipc=not args.dry_run,
+        enable_web=True if getattr(args, "web", False) else None,
+        web_host=getattr(args, "web_host", None),
+        web_port=getattr(args, "web_port", None),
+    )
 
     profile_override = None
     if args.profile or args.target or args.rejoin_min is not None:
@@ -1206,7 +1375,9 @@ def cmd_change_config(args):
             return 1
         conf = load_change_config()
         raw_v = args.value
-        if isinstance(DEFAULT_CHANGE_CONFIG[key], bool):
+        if key == "race_ver":
+            conf[key] = str(raw_v or "").strip()
+        elif isinstance(DEFAULT_CHANGE_CONFIG[key], bool):
             conf[key] = str(raw_v).strip().lower() in ("true", "1", "yes", "on")
         elif isinstance(DEFAULT_CHANGE_CONFIG[key], int):
             conf[key] = max(0, int(raw_v))
@@ -1260,6 +1431,15 @@ def cmd_config(_args=None):
         table.add_row("21", "Webhook status interval (min, 0=off)", f"[yellow]{cfg.get('webhook_interval_minutes', 0)}[/yellow] min")
         table.add_row("22", "Attach screenshot to status webhook", _yn(cfg.get("webhook_screenshot")))
         table.add_row("23", "Discord ping target (e.g. @everyone)", cfg.get("webhook_ping") or "[dim]none[/dim]")
+
+        table.add_row("", "[bold blue]── WEB PANEL / HOT-FOLDER / STABILITY ──[/bold blue]", "")
+        table.add_row("24", "Web Control Panel auto-start", _yn(cfg.get("web_enabled", False)))
+        table.add_row("25", "Web Panel Host : Port", f"[cyan]{cfg.get('web_host', '127.0.0.1')}:{cfg.get('web_port', 8787)}[/cyan]")
+        table.add_row("26", "Web Panel API Token", "[green]set[/green]" if cfg.get("web_token") else "[dim]none (localhost)[/dim]")
+        table.add_row("27", "Download Hub hot-folder sync", _yn(cfg.get("download_hub_sync", True)))
+        table.add_row("28", "Auto-dismiss ANR / crash dialogs", _yn(cfg.get("auto_dismiss_anr", True)))
+        table.add_row("29", "Server-hop public on disconnect", _yn(cfg.get("server_hop_on_disconnect", False)))
+        table.add_row("30", "Error 264 action (cooldown/rotate)", f"[yellow]{cfg.get('error_264_action', 'cooldown')}[/yellow]")
 
         table.add_row("S", "[bold green]Save & apply (hot-reload daemon)[/bold green]", "")
         table.add_row("X", "[bold red]Discard & back[/bold red]", "")
@@ -1323,6 +1503,21 @@ def cmd_config(_args=None):
             cfg["webhook_screenshot"] = not cfg.get("webhook_screenshot", False)
         elif ch == "23":
             cfg["webhook_ping"] = Prompt.ask("Discord ping target (e.g. @everyone, blank=none)", default=cfg.get("webhook_ping") or "")
+        elif ch == "24":
+            cfg["web_enabled"] = not cfg.get("web_enabled", False)
+        elif ch == "25":
+            cfg["web_host"] = Prompt.ask("Web bind host (127.0.0.1 or 0.0.0.0)", default=cfg.get("web_host") or "127.0.0.1").strip()
+            cfg["web_port"] = max(1, min(65535, IntPrompt.ask("Web port", default=int(cfg.get("web_port") or 8787))))
+        elif ch == "26":
+            cfg["web_token"] = Prompt.ask("Web API Bearer token (blank=disable)", default=cfg.get("web_token") or "").strip()
+        elif ch == "27":
+            cfg["download_hub_sync"] = not cfg.get("download_hub_sync", True)
+        elif ch == "28":
+            cfg["auto_dismiss_anr"] = not cfg.get("auto_dismiss_anr", True)
+        elif ch == "29":
+            cfg["server_hop_on_disconnect"] = not cfg.get("server_hop_on_disconnect", False)
+        elif ch == "30":
+            cfg["error_264_action"] = Prompt.ask("Error 264 action", choices=["cooldown", "rotate"], default=cfg.get("error_264_action") or "cooldown")
     return 0
 
 
@@ -1434,7 +1629,7 @@ def _menu_profiles():
                 base["private_link"] = target
             else:
                 base["private_link"] = ""
-            base["check_method"] = Prompt.ask("Check method", choices=["executor", "online"], default=base.get("check_method") or "executor")
+            base["check_method"] = Prompt.ask("Check method", choices=["hybrid", "executor", "online"], default=base.get("check_method") or "hybrid")
             base["rejoin_after_minutes"] = IntPrompt.ask("Mandatory rejoin after X minutes (0=disable)", default=int(base.get("rejoin_after_minutes") or 30))
             base["rotate_after_minutes"] = IntPrompt.ask("Scheduled rotate account every X minutes (0=disable)", default=int(base.get("rotate_after_minutes") or 0))
             base["heartbeat_timeout"] = IntPrompt.ask("Heartbeat stale timeout (sec)", default=int(base.get("heartbeat_timeout") or 45))
@@ -1592,8 +1787,8 @@ def _menu_optimizer():
             title="Window Tab Sorter, Optimizer & Cleaner",
             border_style="green",
         ))
-        console.print("[1] Sort Roblox Tabs (Grid)  [2] Tiny Sort Tabs (Smallest Tiles)  [3] Open All Tabs  [4] Kill Mode  [5] Clear Cache  [6] Low-Graphics + FPS Cap  [7] Logout All Packages  [0] Back")
-        c = Prompt.ask("Select", choices=["0", "1", "2", "3", "4", "5", "6", "7"], default="0")
+        console.print("[1] Sort Roblox Tabs (Grid)  [2] Tiny Sort Tabs (Smallest Tiles)  [3] Open All Tabs  [4] Kill Mode  [5] Clear Cache  [6] Low-Graphics + FPS Cap  [7] Cloud Tune (No Anim + Doze)  [8] Logout All Packages  [0] Back")
+        c = Prompt.ask("Select", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8"], default="0")
         if c == "0":
             return
         if c == "1":
@@ -1603,13 +1798,15 @@ def _menu_optimizer():
         elif c == "3":
             cmd_tabs(argparse.Namespace(action="open-all", package=None))
         elif c == "4":
-            cmd_optimize(argparse.Namespace(package=None, kill_all=True, clear_cache=False, fps=None))
+            cmd_optimize(argparse.Namespace(package=None, kill_all=True, clear_cache=False, fps=None, cloud_tune=False))
         elif c == "5":
-            cmd_optimize(argparse.Namespace(package=None, kill_all=False, clear_cache=True, fps=None))
+            cmd_optimize(argparse.Namespace(package=None, kill_all=False, clear_cache=True, fps=None, cloud_tune=False))
         elif c == "6":
             fps = IntPrompt.ask("Target FPS cap", default=15)
-            cmd_optimize(argparse.Namespace(package=None, kill_all=False, clear_cache=False, fps=fps))
+            cmd_optimize(argparse.Namespace(package=None, kill_all=False, clear_cache=False, fps=fps, cloud_tune=False))
         elif c == "7":
+            cmd_optimize(argparse.Namespace(package=None, kill_all=False, clear_cache=False, fps=None, cloud_tune=True))
+        elif c == "8":
             if Confirm.ask("Logout and remove cookies from ALL configured packages?", default=False):
                 cmd_tabs(argparse.Namespace(action="logout", package=None, call_api=False))
         Prompt.ask("Press Enter", default="")
@@ -1645,11 +1842,13 @@ def interactive_menu():
         enabled = sum(1 for i in cfg["instances"] if i.get("enabled", True))
         ping = ipc_request("ping", timeout=0.6)
         daemon_badge = "[green]ON[/]" if ping.get("ok") else "[dim]OFF[/]"
+        web_badge = f"[green]ON(:{cfg.get('web_port', 8787)})[/]" if cfg.get("web_enabled") else "[dim]OFF[/]"
         console.clear()
         console.print(Panel(
-            f"[bold cyan]Roblox Multi-Instance Auto-Rejoin v3.0 Hybrid (Rejoin + Shouko)[/bold cyan]\n"
+            f"[bold cyan]Roblox Multi-Instance Auto-Rejoin v4.0 Ultra (Hybrid + Web Panel + Hot-Folder)[/bold cyan]\n"
             f"Root: {'[green]OK[/]' if has_root() else '[red]NO[/]'}  •  "
             f"Daemon: {daemon_badge}  •  "
+            f"Web: {web_badge}  •  "
             f"Instances: [cyan]{enabled}/{len(cfg['instances'])}[/]  •  "
             f"Queue: [yellow]{cnt['queue']}[/]  Done: [green]{cnt['done']}[/]  Dead: [red]{cnt['dead']}[/]\n"
             f"CPU: [cyan]{st['cpu_pct']:.0f}%[/]  •  RAM: [cyan]{st['ram_used_mb']:.0f}/{st['ram_total_mb']:.0f}MB ({st['ram_pct']:.0f}%)[/]  •  "
@@ -1663,16 +1862,17 @@ def interactive_menu():
         menu.add_row("2", "Background Daemon & Attach (IPC)")
         menu.add_row("3", "Quick Setup (Detect All Clones + Set Link + Sync Lua)")
         menu.add_row("4", "Manage Instances & Per-Clone Server Links")
-        menu.add_row("5", "Manage Game Profiles & Rules (Executor/Online, Blox Fruits)")
-        menu.add_row("6", "Manage Accounts & Cookies (user:pass:cookie / Extract / Switched)")
-        menu.add_row("7", "Window Tab Sorter, Optimizer & Cleaner")
+        menu.add_row("5", "Manage Game Profiles & Rules (Hybrid/Executor/Online)")
+        menu.add_row("6", "Manage Accounts & Cookies (user:pass:cookie / Prune / Extract)")
+        menu.add_row("7", "Window Tab Sorter, Cloud Tune & Cleaner")
         menu.add_row("8", "Autoexecute Script Manager (Multi-Executor + Shared)")
-        menu.add_row("9", "Download APK from GoFile / Run Benchmark")
-        menu.add_row("10", "[cyan]Configuration (Shouko-Style Table)[/cyan]")
+        menu.add_row("9", "Download Hub / Import Shouko / Live Client Logs / Benchmark")
+        menu.add_row("10", "[cyan]Configuration (v4.0 Table + Web Panel + Hot-Folder)[/cyan]")
+        menu.add_row("11", "[magenta]Start Standalone Web Control Panel (:8787)[/magenta]")
         menu.add_row("0", "[red]Exit[/red]")
         console.print(menu)
 
-        choice = Prompt.ask("Choose", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"], default="1")
+        choice = Prompt.ask("Choose", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"], default="1")
         if choice == "0":
             break
         if choice == "1":
@@ -1697,8 +1897,18 @@ def interactive_menu():
         elif choice == "8":
             _menu_scripts()
         elif choice == "9":
-            act = Prompt.ask("[1] Run Latency Benchmark  [2] Download APK from GoFile", choices=["1", "2"], default="1")
+            act = Prompt.ask(
+                "[1] Sync Download Hub  [2] Import Shouko/config-change  [3] Inspect Roblox Client Logs  [4] Benchmark  [5] GoFile APK",
+                choices=["1", "2", "3", "4", "5"],
+                default="1",
+            )
             if act == "1":
+                cmd_hub(argparse.Namespace(action="sync"))
+            elif act == "2":
+                cmd_hub(argparse.Namespace(action="import-shouko"))
+            elif act == "3":
+                cmd_logs()
+            elif act == "4":
                 cmd_benchmark()
             else:
                 u = Prompt.ask("GoFile URL")
@@ -1706,10 +1916,12 @@ def interactive_menu():
             Prompt.ask("Press Enter", default="")
         elif choice == "10":
             cmd_config()
+        elif choice == "11":
+            cmd_web(argparse.Namespace(action="start", host=None, port=None, token=None))
 
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="rejoin", description="Multi-instance Roblox Auto-Rejoin v2.0 (Termux + Root)")
+    p = argparse.ArgumentParser(prog="rejoin", description="Multi-instance Roblox Auto-Rejoin v4.0 Ultra (Termux + Root)")
     sub = p.add_subparsers(dest="cmd")
 
     pr = sub.add_parser("run", help="Run monitor (headless by default, or --dashboard)")
@@ -1719,6 +1931,9 @@ def build_parser():
     pr.add_argument("--rejoin-min", type=float, help="Override mandatory rejoin_after_minutes")
     pr.add_argument("--dry-run", action="store_true", help="Dry run without killing/launching apps")
     pr.add_argument("--dashboard", action="store_true", help="Use Rich live dashboard UI")
+    pr.add_argument("--web", action="store_true", help="Enable Web Control Panel while running")
+    pr.add_argument("--web-port", type=int, help="Web Panel port (default 8787)")
+    pr.add_argument("--web-host", help="Web Panel bind host (default 127.0.0.1)")
 
     pd = sub.add_parser("detect", help="Detect installed Roblox/Executor packages")
     pd.add_argument("--add", action="store_true", help="Add newly detected packages to config.json")
@@ -1729,7 +1944,17 @@ def build_parser():
     pl.add_argument("--all", action="store_true", help="Deploy across all discovered executor directories")
 
     sub.add_parser("status", help="Show status of instances, profiles, daemon, system, and cookie queue")
-    sub.add_parser("config", help="Open Shouko-style numbered configuration table")
+    sub.add_parser("config", help="Open v4.0 numbered configuration table")
+    sub.add_parser("logs", help="Inspect native Roblox client log states & error codes")
+
+    pweb = sub.add_parser("web", help="Manage standalone Web Control Panel")
+    pweb.add_argument("action", choices=["start", "status", "url"])
+    pweb.add_argument("--host", help="Bind host (127.0.0.1 or 0.0.0.0)")
+    pweb.add_argument("--port", type=int, help="Port number (default 8787)")
+    pweb.add_argument("--token", help="Optional Bearer API token")
+
+    phub = sub.add_parser("hub", help="Manage /storage/emulated/0/Download hot-folder & Shouko import")
+    phub.add_argument("action", choices=["sync", "import-shouko", "status"])
 
     pcc = sub.add_parser("change-config", help="Manage Blox Fruits auto-change config (config-change.json)")
     pcc.add_argument("action", choices=["show", "edit", "reset", "set"])
@@ -1740,6 +1965,7 @@ def build_parser():
     pc.add_argument("action", choices=["list", "add", "validate", "extract", "switched", "fix"])
     pc.add_argument("--file", "-f", help="Read cookies from file")
     pc.add_argument("--cookie", "-c", help="Single cookie string")
+    pc.add_argument("--clean", action="store_true", help="Prune dead/banned/challenged cookies during validate")
     pc.add_argument("--package", "-k", help="Package name for extract (default: all)")
     pc.add_argument("--donor", help="Donor package for 'fix' action")
     pc.add_argument("--save", action="store_true", help="Save extracted valid cookies to cookies.txt")
@@ -1767,6 +1993,7 @@ def build_parser():
     po.add_argument("--fps", type=int, help="Apply low-graphics + FPS cap")
     po.add_argument("--clear-cache", action="store_true", help="Clear app & WebView cache only")
     po.add_argument("--kill-all", action="store_true", help="Kill Mode: stop all Roblox clones + am kill-all")
+    po.add_argument("--cloud-tune", action="store_true", help="Disable OS animations + whitelist Doze + trim background")
 
     pt = sub.add_parser("tabs", help="Arrange/open/logout Roblox window tabs")
     pt.add_argument("action", choices=["sort", "tiny", "open-all", "logout"])
@@ -1797,6 +2024,9 @@ def build_parser():
     pdm.add_argument("--profile", "-p", help="Profile for daemon start")
     pdm.add_argument("--target", "-t", help="Game ID or VIP link for daemon start")
     pdm.add_argument("--rejoin-min", type=float, help="rejoin_after_minutes for daemon start")
+    pdm.add_argument("--web", action="store_true", help="Enable Web Control Panel inside daemon")
+    pdm.add_argument("--web-port", type=int, help="Web Panel port")
+    pdm.add_argument("--web-host", help="Web Panel host")
 
     pw = sub.add_parser("webhook-test", help="Send a test Discord Rich Embed")
     pw.add_argument("--screenshot", action="store_true", help="Attach current device screenshot")
@@ -1827,6 +2057,12 @@ def main():
         return cmd_status(args)
     if args.cmd == "config":
         return cmd_config(args)
+    if args.cmd == "logs":
+        return cmd_logs(args)
+    if args.cmd == "web":
+        return cmd_web(args)
+    if args.cmd == "hub":
+        return cmd_hub(args)
     if args.cmd == "change-config":
         return cmd_change_config(args)
     if args.cmd == "boot":

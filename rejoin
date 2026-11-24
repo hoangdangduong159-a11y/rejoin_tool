@@ -25,6 +25,9 @@ if [ "$(id -u)" = "0" ]; then
         [ -d "$TERMUX_HOME/.termux/boot" ] && chown -R "$OWNER" "$TERMUX_HOME/.termux/boot" 2>/dev/null
         [ -S "$TERMUX_HOME/.rejoin_ipc.sock" ] && chown "$OWNER" "$TERMUX_HOME/.rejoin_ipc.sock" 2>/dev/null
     fi
+    if [ -d "/storage/emulated/0/Download/RejoinTool" ]; then
+        chmod -R u+rwX,g+rwX /storage/emulated/0/Download/RejoinTool 2>/dev/null
+    fi
     exit $rc
 fi
 
