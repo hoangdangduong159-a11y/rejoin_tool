@@ -12,6 +12,7 @@ Cookies.template.db*
 .license.db
 .rejoin_ipc.sock
 switched/
+backups/
 .tmp/
 logs/
 __pycache__/
