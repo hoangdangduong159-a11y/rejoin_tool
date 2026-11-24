@@ -2,7 +2,7 @@
 
 > Chỉ cần copy-paste lệnh, không phải tạo file thủ công.
 > Trên máy đã cài, gõ `rejoin commands` để in lại toàn bộ các lệnh này.
-> Hỗ trợ **Web Dashboard (`:8787`)**, **Hot-Folder `/storage/emulated/0/Download/RejoinTool/`** và **di chuyển dữ liệu từ Shouko (`rejoin hub import-shouko`)**.
+> Hỗ trợ **Tự xếp cửa sổ Roblox mặc định (Auto Resize Tab)**, **tự đồng bộ khi cài thêm hoặc xoá bớt app Roblox**, **Bảng Điều Khiển Web (`:8787`)**, **Thư mục dùng chung `/storage/emulated/0/Download/RejoinTool/`** và **nhập dữ liệu từ Shouko (`rejoin hub import-shouko`)**.
 
 ---
 

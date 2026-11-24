@@ -39,6 +39,7 @@ from rjcore import (
     save_json,
     short,
     su,
+    sync_installed_instances,
     whoami,
     write_app_cookie,
 )
@@ -48,6 +49,7 @@ from sysutils import (
     apply_low_graphics,
     capture_screenshot,
     clear_app_cache,
+    ensure_freeform_support,
     get_batch_pkg_usage,
     get_pkg_ram_mb,
     get_system_stats,
@@ -645,7 +647,9 @@ class InstanceWorker(threading.Thread):
                 if sleep_kill > 0:
                     time.sleep(sleep_kill)
                 extra = (self.profile.get("launch_extra") or "").strip()
-                if self.profile.get("window_mode") == "freeform" and "--windowingMode" not in extra:
+                auto_resize = bool(self.mgr.config.get("sort_tabs", True) or self.mgr.config.get("tiny_sort_tabs", False))
+                wmode = str(self.profile.get("window_mode") or "freeform").lower()
+                if (wmode == "freeform" or (auto_resize and wmode != "fullscreen")) and "--windowingMode" not in extra:
                     extra = (extra + " --windowingMode 5").strip()
                 rc, _, err = launch(
                     self.state.package,
@@ -656,6 +660,8 @@ class InstanceWorker(threading.Thread):
                 )
                 if rc != 0:
                     self.log(self.state.name, f"am start warning (rc={rc}): {err}")
+                elif auto_resize:
+                    self.mgr.request_tab_sort(2.5)
             now = time.time()
             self.launch_ts = now
             self.first_hb_seen = False
@@ -1303,6 +1309,7 @@ class Manager:
         self.stop_event = threading.Event()
         self.workers = {}
         self._maint_thread = None
+        self._pending_sort_ts = 0.0
         self.dry_run = False
         self.enable_ipc = bool(enable_ipc or ipc_sock_path)
         self.ipc_sock_path = ipc_sock_path or DEFAULT_IPC_SOCK
@@ -1314,10 +1321,18 @@ class Manager:
         self.web_token = config.get("web_token", "") if web_token is None else str(web_token)
         self.web_panel = None
 
+    def request_tab_sort(self, delay=2.5):
+        """Schedule an automatic window resize/tile pass shortly after launching a Roblox tab."""
+        self._pending_sort_ts = time.time() + max(0.5, float(delay))
+
     def start(self, instance_names=None, dry_run=False, profile_override=None):
         self.stop_event.clear()
         self.dry_run = bool(dry_run)
         self.store.ensure_files()
+        if not dry_run:
+            sync_installed_instances(self.config, self.store, auto_add=False, prune_uninstalled=True, persist=True)
+            if self.config.get("sort_tabs", True) or self.config.get("tiny_sort_tabs", False):
+                ensure_freeform_support()
         instances = self.config.get("instances") or []
         selected = []
         for inst in instances:
@@ -1451,7 +1466,7 @@ class Manager:
         last_block = 0.0
         last_anr = 0.0
         last_hub = 0.0
-        while not self.stop_event.wait(5.0):
+        while not self.stop_event.wait(2.5):
             now = time.time()
 
             # Batched /proc PID + VmRSS telemetry + native Roblox log tail watcher
@@ -1529,9 +1544,10 @@ class Manager:
                 su("am kill-all", 15)
                 self.logger("SYS", "Auto-cleaned background RAM (am kill-all)")
 
-            if not dry_run and (self.config.get("sort_tabs") or self.config.get("tiny_sort_tabs")):
-                sort_sec = max(10.0, float(self.config.get("sort_tabs_interval_seconds") or 20))
-                if (now - last_sort) >= sort_sec:
+            if not dry_run and (self.config.get("sort_tabs", True) or self.config.get("tiny_sort_tabs")):
+                sort_sec = max(10.0, float(self.config.get("sort_tabs_interval_seconds") or 15))
+                if (self._pending_sort_ts > 0 and now >= self._pending_sort_ts) or (now - last_sort) >= sort_sec:
+                    self._pending_sort_ts = 0.0
                     last_sort = now
                     pkgs = [w.state.package for w in self.workers.values()]
                     sort_roblox_tabs(pkgs, tiny=bool(self.config.get("tiny_sort_tabs", False)))

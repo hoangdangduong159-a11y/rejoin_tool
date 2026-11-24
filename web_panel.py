@@ -29,11 +29,11 @@ from sysutils import (
 )
 
 WEB_UI_HTML = r"""<!DOCTYPE html>
-<html lang="en">
+<html lang="vi">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Rejoin Tool v4.0 Ultra</title>
+<title>Bảng Điều Khiển — Rejoin Tool v4.0 Ultra</title>
 <style>
 :root{--bg:#0b1020;--card:rgba(19,27,46,.88);--line:rgba(148,163,184,.18);--text:#e2e8f0;--muted:#94a3b8;--pri:#38bdf8;--ok:#22c55e;--warn:#f59e0b;--err:#ef4444}
 *{box-sizing:border-box;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
@@ -68,65 +68,65 @@ label.chk input{width:auto}
 <div class="wrap">
   <div class="top">
     <div>
-      <div class="title">Rejoin Tool v4.0 Ultra</div>
-      <div id="sub" style="font-size:12px;color:var(--muted)">Loading telemetry...</div>
+      <div class="title">Bảng Điều Khiển Auto Rejoin Roblox</div>
+      <div id="sub" style="font-size:12px;color:var(--muted)">Đang tải thông tin máy...</div>
     </div>
     <div class="bar">
-      <button class="pri" onclick="act('sort_tabs')">Sort Tabs</button>
-      <button onclick="act('tiny_tabs')">Tiny Tabs</button>
-      <button onclick="act('clean_ram')">Clean RAM</button>
-      <button onclick="act('optimize_cloud')">Cloud Tune</button>
-      <button onclick="act('sync_download')">Sync Download</button>
-      <button onclick="act('reload_config')">Reload</button>
-      <button onclick="act('webhook_test')">Test Webhook</button>
-      <button onclick="setToken()">Token</button>
+      <button class="pri" onclick="act('sort_tabs')">Chia ô cửa sổ</button>
+      <button onclick="act('tiny_tabs')">Thu nhỏ tab</button>
+      <button onclick="act('clean_ram')">Dọn RAM</button>
+      <button onclick="act('optimize_cloud')">Tối ưu máy Cloud</button>
+      <button onclick="act('sync_download')">Đồng bộ Download</button>
+      <button onclick="act('reload_config')">Tải lại cài đặt</button>
+      <button onclick="act('webhook_test')">Test Discord</button>
+      <button onclick="setToken()">Mật khẩu</button>
     </div>
   </div>
 
   <div class="metrics">
-    <div class="card"><div class="kpi-l">CPU / Load</div><div class="kpi-v" id="k_cpu">-</div></div>
-    <div class="card"><div class="kpi-l">RAM Used</div><div class="kpi-v" id="k_ram">-</div></div>
-    <div class="card"><div class="kpi-l">Cookie Queue</div><div class="kpi-v" id="k_q">-</div></div>
-    <div class="card"><div class="kpi-l">Done / Dead</div><div class="kpi-v" id="k_dd">-</div></div>
-    <div class="card"><div class="kpi-l">Disk Free</div><div class="kpi-v" id="k_disk">-</div></div>
+    <div class="card"><div class="kpi-l">CPU / Tải máy</div><div class="kpi-v" id="k_cpu">-</div></div>
+    <div class="card"><div class="kpi-l">RAM đang dùng</div><div class="kpi-v" id="k_ram">-</div></div>
+    <div class="card"><div class="kpi-l">Kho Acc chờ</div><div class="kpi-v" id="k_q">-</div></div>
+    <div class="card"><div class="kpi-l">Đã xong / Lỗi</div><div class="kpi-v" id="k_dd">-</div></div>
+    <div class="card"><div class="kpi-l">Bộ nhớ trống</div><div class="kpi-v" id="k_disk">-</div></div>
   </div>
 
   <div class="card" style="overflow:auto">
     <table>
-      <thead><tr><th>Instance</th><th>Account</th><th>Status</th><th>Mode / HB</th><th>RAM</th><th>Rej / Rot</th><th>Event</th><th>Actions</th></tr></thead>
+      <thead><tr><th>Tab Roblox</th><th>Tài khoản</th><th>Trạng thái</th><th>Kiểm tra / Tín hiệu</th><th>RAM</th><th>Vào lại / Đổi acc</th><th>Sự kiện</th><th>Thao tác</th></tr></thead>
       <tbody id="inst_rows"></tbody>
     </table>
   </div>
 
   <div class="grid2">
     <div class="card">
-      <div style="font-weight:700;margin-bottom:8px">Cookie Queue & Target Link</div>
-      <textarea id="ck_box" rows="3" placeholder="Paste cookie or user:pass:cookie (one per line)"></textarea>
+      <div style="font-weight:700;margin-bottom:8px">Kho Cookie & Link Server Game</div>
+      <textarea id="ck_box" rows="3" placeholder="Dán cookie hoặc user:pass:cookie (mỗi acc 1 dòng)"></textarea>
       <div class="bar" style="margin-top:8px">
-        <button class="pri" onclick="addCookies(false)">Add Cookies</button>
-        <button onclick="addCookies(true)">Add & Prune Dead</button>
+        <button class="pri" onclick="addCookies(false)">Thêm Cookie</button>
+        <button onclick="addCookies(true)">Thêm & Lọc acc lỗi</button>
       </div>
       <div class="row" style="margin-top:10px">
-        <input id="link_box" placeholder="Place ID or VIP/Share link for ALL instances">
-        <button class="pri" style="flex:0 0 auto" onclick="setAllLinks()">Set All</button>
+        <input id="link_box" placeholder="ID Game hoặc Link VIP/Share cho TẤT CẢ Tab">
+        <button class="pri" style="flex:0 0 auto" onclick="setAllLinks()">Gắn tất cả</button>
       </div>
     </div>
 
     <div class="card">
-      <div style="font-weight:700;margin-bottom:8px">Blox Fruits Auto-Change (config-change.json)</div>
+      <div style="font-weight:700;margin-bottom:8px">Tự Đổi Acc Blox Fruits (config-change.json)</div>
       <div class="row">
-        <div><span class="kpi-l">Level</span><input id="bf_level" type="number" min="0"></div>
+        <div><span class="kpi-l">Cấp độ</span><input id="bf_level" type="number" min="0"></div>
         <div><span class="kpi-l">Beli</span><input id="bf_beli" type="number" min="0"></div>
-        <div><span class="kpi-l">Fragments</span><input id="bf_frag" type="number" min="0"></div>
-        <div><span class="kpi-l">Race Ver</span><input id="bf_race" placeholder="0 or V4"></div>
+        <div><span class="kpi-l">Điểm F</span><input id="bf_frag" type="number" min="0"></div>
+        <div><span class="kpi-l">Tộc / Ver</span><input id="bf_race" placeholder="0 hoặc V4"></div>
       </div>
       <div class="checks" id="bf_checks"></div>
-      <button class="pri" onclick="saveBf()">Save BF Config</button>
+      <button class="pri" onclick="saveBf()">Lưu cấu hình Blox Fruits</button>
     </div>
   </div>
 
   <div class="card">
-    <div style="font-weight:700;margin-bottom:6px">Recent Events</div>
+    <div style="font-weight:700;margin-bottom:6px">Nhật ký hoạt động</div>
     <div class="logs" id="logs"></div>
   </div>
 </div>
@@ -143,6 +143,16 @@ label.chk input{width:auto}
   }
 })();
 const BF_BOOLS = ['god_human','sanguine_art','cursed_dual_katana','true_triple_katana','shark_anchor','skull_guitar','mirror_fractal','valkyrie_helm','pull_level'];
+const BF_LABELS = {
+  god_human:'Godhuman', sanguine_art:'Sanguine Art', cursed_dual_katana:'Song Kiếm (CDK)',
+  true_triple_katana:'Tam Kiếm (TTK)', shark_anchor:'Mỏ Neo', skull_guitar:'Đàn (Skull)',
+  mirror_fractal:'Gương', valkyrie_helm:'Mũ Valkyrie', pull_level:'Đã gạt cần'
+};
+const ST_VI = {
+  RUNNING:'Đang chơi', LAUNCHING:'Đang mở', WAITING_COOKIE:'Chờ acc',
+  REJOINING:'Đang vào lại', ROTATING:'Đang đổi acc', PAUSED_CHALLENGE:'Tạm dừng',
+  RETIRED:'Đã nghỉ', STOPPED:'Đã dừng', ERROR:'Báo lỗi', IDLE:'Đang chờ'
+};
 let bfInit = false;
 function hdrs(json){
   const h = {};
@@ -152,26 +162,26 @@ function hdrs(json){
   return h;
 }
 function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.style.display='block';setTimeout(()=>t.style.display='none',2600);}
-function setToken(){const v=prompt('Enter API Bearer Token (blank to clear):', localStorage.getItem('rj_token')||''); if(v!==null){localStorage.setItem('rj_token',v.trim()); refresh();}}
+function setToken(){const v=prompt('Nhập mật khẩu Web (để trống để xoá):', localStorage.getItem('rj_token')||''); if(v!==null){localStorage.setItem('rj_token',v.trim()); refresh();}}
 async function api(path, opts={}){
   const r = await fetch(path, opts);
-  if(r.status===401){toast('Unauthorized: click Token button'); throw new Error('401');}
+  if(r.status===401){toast('Chưa nhập đúng mật khẩu: bấm nút Mật khẩu'); throw new Error('401');}
   return await r.json();
 }
 async function act(action, instance){
   const d = await api('/api/action',{method:'POST',headers:hdrs(true),body:JSON.stringify({action,instance})});
-  toast(d.ok ? ('OK: '+action) : ('Err: '+d.error));
+  toast(d.ok ? ('Đã thực hiện: '+action) : ('Lỗi: '+d.error));
   refresh();
 }
 async function addCookies(prune){
   const text = document.getElementById('ck_box').value;
   const d = await api('/api/cookies',{method:'POST',headers:hdrs(true),body:JSON.stringify({text,prune})});
-  if(d.ok){document.getElementById('ck_box').value=''; toast('Added '+d.added+' cookie(s)'); refresh();}
+  if(d.ok){document.getElementById('ck_box').value=''; toast('Đã thêm '+d.added+' cookie'); refresh();}
 }
 async function setAllLinks(){
   const target = document.getElementById('link_box').value.trim();
   const d = await api('/api/links',{method:'POST',headers:hdrs(true),body:JSON.stringify({instance:'all',target})});
-  toast(d.ok ? 'Updated all targets' : d.error); refresh();
+  toast(d.ok ? 'Đã gắn link cho tất cả Tab' : d.error); refresh();
 }
 async function saveBf(){
   const payload = {
@@ -182,14 +192,15 @@ async function saveBf(){
   };
   for(const k of BF_BOOLS){const el=document.getElementById('chk_'+k); if(el) payload[k]=el.checked;}
   const d = await api('/api/change-config',{method:'POST',headers:hdrs(true),body:JSON.stringify(payload)});
-  toast(d.ok ? 'Saved config-change.json' : d.error); refresh();
+  toast(d.ok ? 'Đã lưu cấu hình Blox Fruits' : d.error); refresh();
 }
 async function refresh(){
   try{
     const d = await api('/api/status',{headers:hdrs(false)});
     if(!d.ok) return;
     const s = d.system || {}, c = d.counts || {};
-    document.getElementById('sub').textContent = (d.daemon_alive?'Live Monitor':'Idle / Local') + ' • Switched: ' + Object.entries(d.switched||{}).filter(([,v])=>v>0).map(([k,v])=>k+':'+v).join(' ');
+    const swTxt = Object.entries(d.switched||{}).filter(([,v])=>v>0).map(([k,v])=>k+':'+v).join(' ');
+    document.getElementById('sub').textContent = (d.daemon_alive?'Đang treo tự động':'Đang chờ (Chưa bật chạy)') + (swTxt ? ' • Phân loại: ' + swTxt : '');
     document.getElementById('k_cpu').textContent = `${Math.round(s.cpu_pct||0)}% (${s.load_1m||0})`;
     document.getElementById('k_ram').textContent = `${Math.round(s.ram_used_mb||0)}/${Math.round(s.ram_total_mb||0)}MB`;
     document.getElementById('k_q').textContent = c.queue ?? 0;
@@ -200,18 +211,19 @@ async function refresh(){
     for(const r of (d.instances||[])){
       const tr = document.createElement('tr');
       const hb = r.check_method==='online' ? `online(${r.presence_strikes||0})` : (r.hb_age!=null ? Math.round(r.hb_age)+'s' : '-');
-      const errTxt = r.last_error_code ? ` [E${r.last_error_code}]` : '';
+      const errTxt = r.last_error_code ? ` [Lỗi ${r.last_error_code}]` : '';
+      const stLabel = ST_VI[r.status] || r.status;
       tr.innerHTML = `<td><b>${r.name}</b><br><span style="font-size:11px;color:var(--muted)">${r.package}</span></td>
         <td>${r.username||'-'}</td>
-        <td><span class="badge ${r.status}">${r.status}</span></td>
+        <td><span class="badge ${r.status}">${stLabel}</span></td>
         <td>${r.check_method||'-'} / ${hb}</td>
         <td>${r.ram_mb!=null?Math.round(r.ram_mb)+'MB':'-'}</td>
         <td>${r.rejoin_count||0} / ${r.rotate_count||0}</td>
         <td style="font-size:11px;color:var(--muted)">${(r.last_event||'-')+errTxt}</td>
         <td><div class="bar">
-          <button onclick="act('rejoin_instance','${r.name}')">Rejoin</button>
-          <button class="warn" onclick="act('rotate_instance','${r.name}')">Rotate</button>
-          <button class="err" onclick="act('stop_instance','${r.name}')">Stop</button>
+          <button onclick="act('rejoin_instance','${r.name}')">Vào lại</button>
+          <button class="warn" onclick="act('rotate_instance','${r.name}')">Đổi acc</button>
+          <button class="err" onclick="act('stop_instance','${r.name}')">Dừng</button>
         </div></td>`;
       tb.appendChild(tr);
     }
@@ -223,9 +235,9 @@ async function refresh(){
       document.getElementById('bf_frag').value = cc.fragment||0;
       document.getElementById('bf_race').value = cc.race_ver??'';
       const box = document.getElementById('bf_checks');
-      box.innerHTML = BF_BOOLS.map(k=>`<label class="chk"><input type="checkbox" id="chk_${k}" ${cc[k]?'checked':''}>${k}</label>`).join('');
+      box.innerHTML = BF_BOOLS.map(k=>`<label class="chk"><input type="checkbox" id="chk_${k}" ${cc[k]?'checked':''}>${BF_LABELS[k]||k}</label>`).join('');
     }
-    document.getElementById('logs').textContent = (d.logs||[]).join('\n') || 'Waiting for logs...';
+    document.getElementById('logs').textContent = (d.logs||[]).join('\n') || 'Đang chờ nhật ký...';
   }catch(e){}
 }
 refresh(); setInterval(refresh, 3000);

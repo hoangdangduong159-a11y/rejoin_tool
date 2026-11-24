@@ -53,6 +53,7 @@ from rjcore import (
     short,
     su,
     suggest_instance_name,
+    sync_installed_instances,
     validate_cookies_parallel,
     whoami,
     write_app_cookie,
@@ -115,7 +116,15 @@ def bootstrap():
                 "use_cookie_queue": True,
                 "enabled": True,
             })
-        save_config({"webhook": "", "stagger_launch_seconds": 8, "instances": instances})
+        save_config({
+            "webhook": "",
+            "stagger_launch_seconds": 8,
+            "sort_tabs": True,
+            "sort_tabs_interval_seconds": 15,
+            "instances": instances,
+        })
+    elif os.environ.get("RJ_SKIP_PKG_SYNC") != "1":
+        sync_installed_instances(load_config(), Store(), auto_add=True, prune_uninstalled=True, persist=True)
 
 
 def _fmt_sec(sec):
@@ -131,32 +140,46 @@ def _fmt_sec(sec):
     return f"{s}s"
 
 
+STATUS_LABELS_VI = {
+    "RUNNING": "Đang chơi",
+    "LAUNCHING": "Đang mở game",
+    "WAITING_COOKIE": "Chờ thêm acc",
+    "REJOINING": "Đang vào lại",
+    "ROTATING": "Đang đổi acc",
+    "PAUSED_CHALLENGE": "Dừng (Captcha/Xác minh)",
+    "RETIRED": "Đã nghỉ (Acc xoá)",
+    "STOPPED": "Đã dừng",
+    "ERROR": "Báo lỗi",
+    "IDLE": "Đang chờ",
+}
+
+
 def _build_dashboard_layout(rows, counts, sys_st, log_lines, switched=None, title_suffix=""):
     sw_txt = ""
     if switched:
         parts = [f"{k}:{v}" for k, v in switched.items() if v > 0]
         if parts:
-            sw_txt = "  |  Switched: " + " ".join(parts)
+            sw_txt = "  |  Đã phân loại: " + " ".join(parts)
 
     table = Table(
         title=(
-            f"Roblox Multi-Instance Monitor{title_suffix}  |  Queue: {counts['queue']}  Done: {counts['done']}  Dead: {counts['dead']}{sw_txt}\n"
+            f"📊 Bảng Theo Dõi Auto Rejoin Roblox{title_suffix}  |  Kho Acc chờ: {counts['queue']}  Đã xong: {counts['done']}  Acc lỗi: {counts['dead']}{sw_txt}\n"
             f"[dim]CPU: {sys_st.get('cpu_pct', 0):.0f}%  |  RAM: {sys_st['ram_used_mb']:.0f}/{sys_st['ram_total_mb']:.0f}MB ({sys_st['ram_pct']:.0f}%)  |  "
-            f"Tool: {sys_st.get('tool_ram_mb', 0):.0f}MB  |  Disk Free: {sys_st['disk_free_gb']}GB  |  Load: {sys_st['load_1m']}[/dim]"
+            f"Tool: {sys_st.get('tool_ram_mb', 0):.0f}MB  |  Bộ nhớ trống: {sys_st['disk_free_gb']}GB  |  Tải máy: {sys_st['load_1m']}[/dim]"
         ),
         box=box.ROUNDED,
         border_style="bright_blue",
     )
-    table.add_column("Instance", style="bold cyan")
-    table.add_column("Package", style="dim")
-    table.add_column("Profile", style="magenta")
-    table.add_column("Account", style="green")
-    table.add_column("Status")
+    table.add_column("Tab", style="bold cyan")
+    table.add_column("Gói App", style="dim")
+    table.add_column("Cấu hình", style="magenta")
+    table.add_column("Tài khoản", style="green")
+    table.add_column("Trạng thái")
     table.add_column("RAM", justify="right")
-    table.add_column("HB/Chk", justify="right")
-    table.add_column("Next Rejoin", justify="right")
-    table.add_column("Rejoins/Rot", justify="right")
-    table.add_column("Stats / Last Event", style="dim")
+    table.add_column("Tín hiệu", justify="right")
+    table.add_column("Vào lại sau", justify="right")
+    table.add_column("Vào lại/Đổi acc", justify="right")
+    table.add_column("Thông tin / Sự kiện", style="dim")
 
     status_colors = {
         "RUNNING": "green",
@@ -174,6 +197,7 @@ def _build_dashboard_layout(rows, counts, sys_st, log_lines, switched=None, titl
     for row in rows:
         st = row["status"]
         col = status_colors.get(st, "white")
+        st_label = STATUS_LABELS_VI.get(st, st)
         if row.get("check_method") == "online":
             hb_str = f"online({row.get('presence_strikes', 0)})"
         else:
@@ -186,7 +210,7 @@ def _build_dashboard_layout(rows, counts, sys_st, log_lines, switched=None, titl
             row["package"],
             row["profile_name"],
             row["username"],
-            f"[{col}]{st}[/{col}]",
+            f"[{col}]{st_label}[/{col}]",
             ram_str,
             hb_str,
             _fmt_sec(row.get("next_rejoin_in")),
@@ -195,8 +219,8 @@ def _build_dashboard_layout(rows, counts, sys_st, log_lines, switched=None, titl
         )
 
     log_panel = Panel(
-        "\n".join(log_lines) or "[dim]Waiting for events...[/dim]",
-        title="Recent Logs (Ctrl+C to detach/stop)",
+        "\n".join(log_lines) or "[dim]Đang chờ sự kiện...[/dim]",
+        title="Nhật ký hoạt động (Bấm Ctrl+C để thoát bảng)",
         border_style="dim",
     )
 
@@ -225,12 +249,12 @@ def cmd_detect(args):
     cfg = load_config()
     pkgs = detect_packages(prefix=cfg.get("package_prefix", ""))
     if not pkgs:
-        console.print("[yellow]No packages handling roblox:// links found.[/yellow]")
+        console.print("[yellow]Không tìm thấy app Roblox / Executor nào đang cài trên máy.[/yellow]")
         return 1
-    table = Table(title="Detected Roblox / Executor Packages", box=box.ROUNDED)
-    table.add_column("#", justify="right", style="cyan")
-    table.add_column("Package", style="bold green")
-    table.add_column("Clone Info", style="dim")
+    table = Table(title="Danh sách Tab Roblox / Executor đang cài trên máy", box=box.ROUNDED)
+    table.add_column("STT", justify="right", style="cyan")
+    table.add_column("Gói App", style="bold green")
+    table.add_column("Thông tin Clone", style="dim")
     metas = {}
     for idx, p in enumerate(pkgs, 1):
         meta = read_clone_metadata(p)
@@ -241,29 +265,12 @@ def cmd_detect(args):
         table.add_row(str(idx), p, info)
     console.print(table)
 
-    if args.add:
-        existing = {i["package"] for i in cfg["instances"]}
-        used_names = {i.get("name") for i in cfg["instances"] if i.get("name")}
-        added = 0
-        for p in pkgs:
-            if p not in existing:
-                idx = len(cfg["instances"]) + 1
-                name = suggest_instance_name(p, idx, metadata=metas.get(p), used_names=used_names)
-                used_names.add(name)
-                execs = scan_executor_dirs(pkg=p)
-                cfg["instances"].append({
-                    "name": name,
-                    "package": p,
-                    "profile": "default",
-                    "target": "",
-                    "workspace": execs[0]["workspace"] if execs else DEFAULT_WORKSPACE,
-                    "autoexec": execs[0]["autoexec"] if execs else DEFAULT_AUTOEXEC,
-                    "use_cookie_queue": True,
-                    "enabled": True,
-                })
-                added += 1
-        save_config(cfg)
-        console.print(f"[green]Added {added} new instance(s) to config.json[/green]")
+    if getattr(args, "add", False):
+        res = sync_installed_instances(cfg, Store(), auto_add=True, prune_uninstalled=True, persist=True)
+        console.print(
+            f"[green]Đã đồng bộ {len(cfg.get('instances', []))} Tab Roblox đang cài "
+            f"(thêm mới {len(res['added'])}, gỡ bỏ {len(res['removed'])} tab cũ đã xoá).[/green]"
+        )
     return 0
 
 
@@ -292,30 +299,32 @@ def cmd_status(_args):
     sw = store.switched_counts()
     sys_st = get_system_stats()
     hb_ok = os.path.exists(os.path.join(DEFAULT_AUTOEXEC, HEARTBEAT_FILENAME))
-    daemon_ping = ipc_request("ping", timeout=1.0)
-    daemon_txt = f"[green]RUNNING (pid={daemon_ping['result'].get('pid')})[/]" if daemon_ping.get("ok") else "[dim]STOPPED[/]"
+    bg_ping = ipc_request("ping", timeout=1.0)
+    bg_txt = f"[green]ĐANG CHẠY (PID {bg_ping['result'].get('pid')})[/]" if bg_ping.get("ok") else "[dim]ĐANG TẮT[/]"
+    resize_txt = "[green]Thu nhỏ[/]" if cfg.get("tiny_sort_tabs") else ("[green]Tự chia ô[/]" if cfg.get("sort_tabs", True) else "[yellow]Đang tắt[/]")
     sw_non_zero = "  ".join(f"{k}={v}" for k, v in sw.items() if v > 0) or "-"
 
     console.print(
         Panel(
-            f"Root: [{'green' if root_ok else 'red'}]{'YES' if root_ok else 'NO'}[/]  |  "
-            f"Daemon IPC: {daemon_txt}  |  "
-            f"Autoexec Heartbeat: [{'green' if hb_ok else 'yellow'}]{'DEPLOYED' if hb_ok else 'MISSING'}[/]\n"
-            f"Cookies Queue: [cyan]{counts['queue']}[/]  Done: [green]{counts['done']}[/]  Dead: [red]{counts['dead']}[/]  |  Switched: [dim]{sw_non_zero}[/]\n"
+            f"Quyền Root: [{'green' if root_ok else 'red'}]{'ĐÃ CẤP' if root_ok else 'CHƯA CÓ'}[/]  |  "
+            f"Treo ngầm 24/7: {bg_txt}  |  "
+            f"Tự xếp cửa sổ: {resize_txt}  |  "
+            f"Script Heartbeat: [{'green' if hb_ok else 'yellow'}]{'ĐÃ CÀI' if hb_ok else 'CHƯA CÀI'}[/]\n"
+            f"Kho Acc chờ: [cyan]{counts['queue']}[/]  Đã xong: [green]{counts['done']}[/]  Acc lỗi: [red]{counts['dead']}[/]  |  Đã phân loại: [dim]{sw_non_zero}[/]\n"
             f"CPU: [cyan]{sys_st['cpu_pct']:.0f}%[/]  |  RAM: [cyan]{sys_st['ram_used_mb']:.0f}/{sys_st['ram_total_mb']:.0f}MB ({sys_st['ram_pct']:.0f}%)[/]  |  "
-            f"Disk Free: [cyan]{sys_st['disk_free_gb']}/{sys_st['disk_total_gb']}GB[/]  |  Load: {sys_st['load_1m']}",
-            title="Rejoin Tool Status",
+            f"Bộ nhớ trống: [cyan]{sys_st['disk_free_gb']}/{sys_st['disk_total_gb']}GB[/]  |  Tải máy: {sys_st['load_1m']}",
+            title="Trạng thái Hệ thống Auto Rejoin",
             border_style="cyan",
         )
     )
 
-    table = Table(title="Configured Instances", box=box.ROUNDED)
-    table.add_column("Name", style="bold cyan")
-    table.add_column("Package")
-    table.add_column("Profile", style="magenta")
-    table.add_column("Target", style="dim")
-    table.add_column("Enabled")
-    table.add_column("Assigned Account", style="green")
+    table = Table(title="Danh sách Tab Roblox đã cấu hình", box=box.ROUNDED)
+    table.add_column("Tên Tab", style="bold cyan")
+    table.add_column("Gói App")
+    table.add_column("Cấu hình", style="magenta")
+    table.add_column("Link Game / Place ID", style="dim")
+    table.add_column("Trạng thái")
+    table.add_column("Tài khoản đang gắn", style="green")
 
     assigned = store.all_assigned()
     for inst in cfg["instances"]:
@@ -325,12 +334,12 @@ def cmd_status(_args):
             inst["name"],
             inst["package"],
             inst.get("profile", "default"),
-            (inst.get("target") or "-")[:28],
-            "[green]yes[/]" if inst.get("enabled", True) else "[dim]no[/]",
+            (inst.get("target") or "(theo cấu hình)")[:28],
+            "[green]Bật[/]" if inst.get("enabled", True) else "[dim]Tắt[/]",
             acc,
         )
     console.print(table)
-    console.print(f"[dim]Profiles: {', '.join(list_profiles()) or '-'}[/dim]")
+    console.print(f"[dim]Danh sách cấu hình game: {', '.join(list_profiles()) or '-'}[/dim]")
     return 0
 
 
@@ -814,7 +823,7 @@ def cmd_daemon(args):
     if args.action == "start":
         ping = ipc_request("ping", timeout=1.0)
         if ping.get("ok"):
-            console.print(f"[yellow]Daemon is already running (pid={ping['result'].get('pid')}).[/yellow]")
+            console.print(f"[yellow]Tool treo ngầm đang chạy sẵn rồi (PID {ping['result'].get('pid')}).[/yellow]")
             return 0
         run_cmd = [sys.executable, os.path.join(BASE, "main.py"), "run"]
         if getattr(args, "profile", None):
@@ -844,34 +853,34 @@ def cmd_daemon(args):
             time.sleep(0.2)
             p = ipc_request("ping", timeout=1.0)
             if p.get("ok"):
-                console.print(f"[green]Daemon started (pid={proc.pid}, sock={DEFAULT_IPC_SOCK}).[/green]")
+                console.print(f"[green]Đã bật treo ngầm 24/7 thành công (PID {proc.pid}).[/green]")
                 return 0
-        console.print(f"[yellow]Daemon spawned (pid={proc.pid}), check {log_path} if IPC not ready.[/yellow]")
+        console.print(f"[yellow]Đã khởi động tiến trình chạy nền (PID {proc.pid}), xem chi tiết tại {log_path} nếu chưa kết nối.[/yellow]")
         return 0
 
     if args.action == "stop":
         res = ipc_request("stop", timeout=2.0)
         if res.get("ok"):
-            console.print("[yellow]Stop requested via IPC.[/yellow]")
+            console.print("[yellow]Đã gửi lệnh dừng treo ngầm an toàn.[/yellow]")
             return 0
         r = subprocess.run(["pkill", "-INT", "-f", "/rejoin_tool/main.py"], capture_output=True, text=True)
         if r.returncode != 0:
             su(f"pkill -INT -f '{PKILL_PATTERN}'", 10)
-        console.print("[yellow]Sent stop signal (SIGINT) to daemon.[/yellow]")
+        console.print("[yellow]Đã gửi tín hiệu dừng tool đang chạy nền.[/yellow]")
         return 0
 
     if args.action == "reload":
         res = ipc_request("reload_config", timeout=3.0)
         if res.get("ok"):
-            console.print(f"[green]Reloaded daemon config: {res['result']}[/green]")
+            console.print(f"[green]Đã áp dụng cài đặt mới cho tool đang chạy: {res['result']}[/green]")
             return 0
-        console.print(f"[red]Daemon not reachable ({res.get('error')}).[/red]")
+        console.print(f"[red]Chưa thấy tool treo ngầm đang chạy ({res.get('error')}).[/red]")
         return 1
 
     if args.action == "status":
         res = ipc_request("status", timeout=2.0)
         if not res.get("ok"):
-            console.print(f"[dim]Daemon not running ({res.get('error')}).[/dim]")
+            console.print(f"[dim]Tool treo ngầm đang tắt ({res.get('error')}).[/dim]")
             return 1
         data = res["result"]
         layout = _build_dashboard_layout(
@@ -880,7 +889,7 @@ def cmd_daemon(args):
             data["system"],
             data.get("logs") or [],
             switched=data.get("switched"),
-            title_suffix=" [Daemon]",
+            title_suffix=" [Đang treo ngầm]",
         )
         console.print(layout)
         return 0
@@ -888,7 +897,7 @@ def cmd_daemon(args):
     if args.action == "attach":
         res = ipc_request("status", timeout=2.0)
         if not res.get("ok"):
-            console.print(f"[red]Cannot attach: daemon not running ({res.get('error')}).[/red]")
+            console.print(f"[red]Không thể xem bảng: tool treo ngầm chưa chạy ({res.get('error')}).[/red]")
             return 1
         try:
             with Live(
@@ -898,7 +907,7 @@ def cmd_daemon(args):
                     res["result"]["system"],
                     res["result"].get("logs") or [],
                     switched=res["result"].get("switched"),
-                    title_suffix=" [Daemon Attached]",
+                    title_suffix=" [Đang treo ngầm]",
                 ),
                 console=console,
                 refresh_per_second=1,
@@ -916,12 +925,12 @@ def cmd_daemon(args):
                             d["system"],
                             d.get("logs") or [],
                             switched=d.get("switched"),
-                            title_suffix=" [Daemon Attached]",
+                            title_suffix=" [Đang treo ngầm]",
                         )
                     )
         except KeyboardInterrupt:
             pass
-        console.print("[dim]Detached from daemon (monitor continues running).[/dim]")
+        console.print("[dim]Đã thoát bảng xem (tool vẫn tiếp tục treo ngầm bình thường).[/dim]")
         return 0
     return 0
 
@@ -929,51 +938,36 @@ def cmd_daemon(args):
 def cmd_quick_setup(args):
     """Shouko-style 1-step setup: auto-detect all packages, assign link/profile, deploy Lua + shared scripts."""
     cfg = load_config()
+    store = Store()
+    sync_installed_instances(cfg, store, auto_add=True, prune_uninstalled=True, persist=False)
     pkgs = detect_packages(prefix=cfg.get("package_prefix", ""))
     if not pkgs:
-        console.print("[red]No Roblox/Executor packages detected.[/red]")
+        console.print("[red]Không tìm thấy app Roblox / Executor nào trên máy.[/red]")
         return 1
     prof_name = getattr(args, "profile", None) or "default"
     try:
         prof = load_profile(prof_name)
     except FileNotFoundError as e:
-        console.print(f"[red]{e}[/red]")
+        console.print(f"[red]Không tìm thấy cấu hình '{prof_name}': {e}[/red]")
         return 1
 
     target = (getattr(args, "target", None) or "").strip()
     by_pkg = {i["package"]: i for i in cfg["instances"] if i.get("package")}
-    used_names = {i.get("name") for i in cfg["instances"] if i.get("name")}
     for p in pkgs:
         if p in by_pkg:
             by_pkg[p]["profile"] = prof_name
             if target:
                 by_pkg[p]["target"] = target
             by_pkg[p]["enabled"] = True
-        else:
-            idx = len(cfg["instances"]) + 1
-            name = suggest_instance_name(p, idx, used_names=used_names)
-            used_names.add(name)
-            execs = scan_executor_dirs(pkg=p)
-            cfg["instances"].append({
-                "name": name,
-                "package": p,
-                "profile": prof_name,
-                "target": target,
-                "workspace": execs[0]["workspace"] if execs else DEFAULT_WORKSPACE,
-                "autoexec": execs[0]["autoexec"] if execs else DEFAULT_AUTOEXEC,
-                "use_cookie_queue": True,
-                "enabled": True,
-            })
     save_config(cfg)
     ipc_request("reload_config", timeout=1.5)
 
     hub_dir = cfg.get("download_hub_dir") or DEFAULT_HUB_DIR
     ensure_hub_dirs(hub_dir)
-    store = Store()
     store.ensure_files()
     hot_added = ingest_hot_cookies(store, hub_dir=hub_dir)
     if hot_added:
-        console.print(f"[green]Ingested {hot_added} cookie(s) from Download/cookie.txt.[/green]")
+        console.print(f"[green]Đã tự nạp {hot_added} cookie từ Download/cookie.txt.[/green]")
 
     extra_lua = None
     if prof.get("lua"):
@@ -983,10 +977,10 @@ def cmd_quick_setup(args):
         packages=pkgs,
         sync_shared=bool(cfg.get("sync_shared_scripts", True)),
     )
-    console.print(f"[green]Quick Setup complete: {len(pkgs)} package(s), profile='{prof_name}', deployed {len(dep)} Lua/shared file(s).[/green]")
+    console.print(f"[green]Cài đặt nhanh xong: {len(pkgs)} Tab Roblox, cấu hình='{prof_name}', đã chép {len(dep)} file Lua/Script.[/green]")
     if getattr(args, "start", False):
         return cmd_run(argparse.Namespace(instance=None, profile=None, target=None, rejoin_min=None, dry_run=False, dashboard=True, web=bool(cfg.get("web_enabled")), web_port=None, web_host=None))
-    console.print("[dim]Xem lệnh chạy root / Termux:Boot / Stop (kiểu QH Rejoin): rejoin commands[/dim]")
+    console.print("[dim]Xem lệnh chạy nhanh / Tự mở khi bật máy / Dừng tool: rejoin commands[/dim]")
     return 0
 
 
@@ -1291,21 +1285,21 @@ def _yn(val):
 
 
 _CHANGE_BF_FIELDS = [
-    ("level", "Min Level (0=ignore)", "int"),
-    ("beli", "Min Beli (0=ignore)", "int"),
-    ("fragment", "Min Fragments (0=ignore)", "int"),
-    ("bounty/honor", "Min Bounty / Honor (0=ignore)", "int"),
-    ("tier", "Min Race Tier (0=ignore)", "int"),
-    ("race_ver", "Required Race / Version (blank=any)", "str"),
-    ("pull_level", "Pull Lever completed", "bool"),
-    ("god_human", "Godhuman", "bool"),
-    ("sanguine_art", "Sanguine Art", "bool"),
-    ("cursed_dual_katana", "Cursed Dual Katana (CDK)", "bool"),
-    ("true_triple_katana", "True Triple Katana (TTK)", "bool"),
-    ("shark_anchor", "Shark Anchor", "bool"),
-    ("skull_guitar", "Skull Guitar", "bool"),
-    ("mirror_fractal", "Mirror Fractal", "bool"),
-    ("valkyrie_helm", "Valkyrie Helm", "bool"),
+    ("level", "Cấp độ tối thiểu (0=bỏ qua)", "int"),
+    ("beli", "Số Beli tối thiểu (0=bỏ qua)", "int"),
+    ("fragment", "Số Điểm F tối thiểu (0=bỏ qua)", "int"),
+    ("bounty/honor", "Bounty / Honor tối thiểu (0=bỏ qua)", "int"),
+    ("tier", "Cấp Tộc V4 tối thiểu (0=bỏ qua)", "int"),
+    ("race_ver", "Tên Tộc / Phiên bản yêu cầu (trống=bất kỳ)", "str"),
+    ("pull_level", "Đã gạt cần (Pull Lever)", "bool"),
+    ("god_human", "Đã có Godhuman", "bool"),
+    ("sanguine_art", "Đã có Sanguine Art", "bool"),
+    ("cursed_dual_katana", "Đã có Song Kiếm (CDK)", "bool"),
+    ("true_triple_katana", "Đã có Tam Kiếm (TTK)", "bool"),
+    ("shark_anchor", "Đã có Mỏ Neo (Shark Anchor)", "bool"),
+    ("skull_guitar", "Đã có Đàn (Skull Guitar)", "bool"),
+    ("mirror_fractal", "Đã có Gương (Mirror Fractal)", "bool"),
+    ("valkyrie_helm", "Đã có Mũ Valkyrie", "bool"),
 ]
 
 
@@ -1314,28 +1308,28 @@ def _menu_change_config():
     while True:
         console.clear()
         table = Table(
-            title="[bold cyan]Blox Fruits Auto-Change Criteria (config-change.json)[/bold cyan]",
+            title="[bold cyan]Điều Kiện Tự Đổi Acc Blox Fruits (config-change.json)[/bold cyan]",
             box=box.ROUNDED,
             show_lines=True,
         )
         table.add_column("#", justify="right", style="bright_magenta", width=4)
-        table.add_column("Condition", style="cyan")
-        table.add_column("Target Value")
+        table.add_column("Điều kiện kiểm tra", style="cyan")
+        table.add_column("Giá trị yêu cầu")
         for idx, (key, label, ftype) in enumerate(_CHANGE_BF_FIELDS, 1):
             val = conf.get(key)
             if ftype == "bool":
                 disp = _yn(val)
             elif ftype == "int":
-                disp = f"[yellow]{val}[/yellow]" if val else "[dim]0 (ignored)[/dim]"
+                disp = f"[yellow]{val}[/yellow]" if val else "[dim]0 (bỏ qua)[/dim]"
             else:
-                disp = f"[yellow]{val}[/yellow]" if val else "[dim]any (ignored)[/dim]"
+                disp = f"[yellow]{val}[/yellow]" if val else "[dim]bất kỳ (bỏ qua)[/dim]"
             table.add_row(str(idx), label, disp)
-        table.add_row("R", "[yellow]Reset all to defaults (disable all checks)[/yellow]", "")
-        table.add_row("S", "[bold green]Save & hot-reload daemon[/bold green]", "")
-        table.add_row("X", "[bold red]Back[/bold red]", "")
+        table.add_row("R", "[yellow]Đặt lại mặc định (tắt mọi điều kiện)[/yellow]", "")
+        table.add_row("S", "[bold green]Lưu & áp dụng ngay[/bold green]", "")
+        table.add_row("X", "[bold red]Quay lại[/bold red]", "")
         console.print(table)
 
-        ch = Prompt.ask("Select # (or R=reset, S=save, X=back)", default="X").strip().upper()
+        ch = Prompt.ask("Chọn số (hoặc R=đặt lại, S=lưu, X=quay lại)", default="X").strip().upper()
         if ch == "X":
             return 0
         if ch == "R":
@@ -1344,7 +1338,7 @@ def _menu_change_config():
         if ch == "S":
             save_change_config(conf)
             res = ipc_request("reload_config", timeout=1.5)
-            console.print("[green]Saved config-change.json" + (" & reloaded daemon.[/green]" if res.get("ok") else ".[/green]"))
+            console.print("[green]Đã lưu config-change.json" + (" & áp dụng ngay cho tool đang chạy.[/green]" if res.get("ok") else ".[/green]"))
             time.sleep(1)
             return 0
         if ch.isdigit() and 1 <= int(ch) <= len(_CHANGE_BF_FIELDS):
@@ -1396,56 +1390,56 @@ def cmd_config(_args=None):
     cfg = load_config()
     while True:
         console.clear()
-        table = Table(title="[bold cyan]Rejoin Configuration (Shouko-Style)[/bold cyan]", box=box.ROUNDED, show_lines=True)
+        table = Table(title="[bold cyan]⚙ Cài Đặt Chung Auto Rejoin[/bold cyan]", box=box.ROUNDED, show_lines=True)
         table.add_column("#", justify="right", style="bright_magenta", width=4)
-        table.add_column("Setting", style="cyan")
-        table.add_column("Current Value")
+        table.add_column("Mục cài đặt", style="cyan")
+        table.add_column("Trạng thái hiện tại")
 
-        table.add_row("", "[bold blue]── ACCOUNT / CHANGE ACCOUNT ──[/bold blue]", "")
-        table.add_row("1", "Device name (Webhook header)", cfg.get("device_name") or "[dim]not set[/dim]")
-        table.add_row("2", "Package prefix filter", cfg.get("package_prefix") or "[dim]auto[/dim]")
-        table.add_row("3", "Keep screen awake (stayon)", _yn(cfg.get("stay_awake")))
-        table.add_row("4", "Auto clean background RAM (min, 0=off)", f"[yellow]{cfg.get('auto_clean_ram_minutes', 0)}[/yellow] min")
-        table.add_row("5", "Auto change account (Custom - <User>.txt)", _yn(cfg.get("change_acc_cus", True)))
-        table.add_row("6", "Auto change account (Blox Fruit)", _yn(cfg.get("change_acc_bf", False)))
-        table.add_row("7", "Edit Blox Fruit change conditions (config-change.json)", "[dim]open editor[/dim]")
-        table.add_row("8", "Auto cross-block accounts (split servers)", _yn(cfg.get("auto_block_accounts", False)))
+        table.add_row("", "[bold blue]── TỰ XẾP CỬA SỔ & GIẢM LAG ──[/bold blue]", "")
+        table.add_row("1", "Tự động chia ô cửa sổ Roblox (Auto Resize Tab)", _yn(cfg.get("sort_tabs", True)))
+        table.add_row("2", "Xếp cửa sổ dạng ô thu nhỏ (Tiny Tabs)", _yn(cfg.get("tiny_sort_tabs")))
+        table.add_row("3", "Chu kỳ tự xếp lại cửa sổ (giây)", f"[yellow]{cfg.get('sort_tabs_interval_seconds', 15)}[/yellow] giây")
+        table.add_row("4", "Đóng toàn bộ tab nếu 1 tab bị văng", _yn(cfg.get("kill_all_on_crash")))
+        table.add_row("5", "Chuyển về Termux trước khi tắt tab Roblox", _yn(cfg.get("focus_before_kill", True)))
+        table.add_row("6", "Giữ màn hình luôn sáng (chống tắt màn)", _yn(cfg.get("stay_awake")))
+        table.add_row("7", "Tự dọn RAM máy định kỳ (phút, 0=tắt)", f"[yellow]{cfg.get('auto_clean_ram_minutes', 0)}[/yellow] phút")
 
-        table.add_row("", "[bold blue]── TABS / PROCESS / SHARED LUA ──[/bold blue]", "")
-        table.add_row("9", "Auto sort Roblox tabs (grid)", _yn(cfg.get("sort_tabs")))
-        table.add_row("10", "Tiny sort tabs (smallest tiles)", _yn(cfg.get("tiny_sort_tabs")))
-        table.add_row("11", "Kill all tabs if 1 crashes", _yn(cfg.get("kill_all_on_crash")))
-        table.add_row("12", "Safe focus switch before force-stop", _yn(cfg.get("focus_before_kill", True)))
-        table.add_row("13", "Auto-sync shared/Autoexec & Workspace", _yn(cfg.get("sync_shared_scripts", True)))
+        table.add_row("", "[bold blue]── TÀI KHOẢN & TỰ ĐỔI ACC ──[/bold blue]", "")
+        table.add_row("8", "Tự đổi acc kiểu Custom (<TênAcc>.txt)", _yn(cfg.get("change_acc_cus", True)))
+        table.add_row("9", "Tự đổi acc Blox Fruits theo chỉ số", _yn(cfg.get("change_acc_bf", False)))
+        table.add_row("10", "Chỉnh điều kiện đổi acc Blox Fruits (config-change.json)", "[dim]mở bảng chỉnh[/dim]")
+        table.add_row("11", "Tự chặn chéo các acc (tránh trùng server thường)", _yn(cfg.get("auto_block_accounts", False)))
+        table.add_row("12", "Tự đồng bộ thư mục Script & Workspace dùng chung", _yn(cfg.get("sync_shared_scripts", True)))
+        table.add_row("13", "Lọc tên gói App (để trống = tự nhận tất cả)", cfg.get("package_prefix") or "[dim]tự động[/dim]")
 
-        table.add_row("", "[bold blue]── TIMING ──[/bold blue]", "")
-        table.add_row("14", "Stagger delay between launches (sec)", f"[yellow]{cfg.get('stagger_launch_seconds', 8)}[/yellow] sec")
-        table.add_row("15", "Splash -> protocol open delay (sec)", f"[yellow]{cfg.get('open_delay_seconds', 2)}[/yellow] sec")
-        table.add_row("16", "Sleep after kill (sec)", f"[yellow]{cfg.get('sleep_after_kill_seconds', 2)}[/yellow] sec")
-        table.add_row("17", "Tab sort interval (sec)", f"[yellow]{cfg.get('sort_tabs_interval_seconds', 20)}[/yellow] sec")
+        table.add_row("", "[bold blue]── THỜI GIAN MỞ TAB ──[/bold blue]", "")
+        table.add_row("14", "Khoảng nghỉ giữa mỗi lần mở tab (giây)", f"[yellow]{cfg.get('stagger_launch_seconds', 8)}[/yellow] giây")
+        table.add_row("15", "Thời gian chờ màn hình chờ -> vào game (giây)", f"[yellow]{cfg.get('open_delay_seconds', 2)}[/yellow] giây")
+        table.add_row("16", "Thời gian nghỉ sau khi tắt app (giây)", f"[yellow]{cfg.get('sleep_after_kill_seconds', 2)}[/yellow] giây")
 
-        table.add_row("", "[bold blue]── WEBHOOK ──[/bold blue]", "")
-        table.add_row("18", "Monitor Webhook URL", "[green]set[/green]" if cfg.get("webhook") else "[red]off[/red]")
-        table.add_row("19", "Account Change Webhook URL", "[green]set[/green]" if cfg.get("webhook_change_url") else "[dim]inherit monitor[/dim]")
-        table.add_row("20", "Alert / Challenge Webhook URL", "[green]set[/green]" if cfg.get("webhook_alert_url") else "[dim]inherit monitor[/dim]")
-        table.add_row("21", "Webhook status interval (min, 0=off)", f"[yellow]{cfg.get('webhook_interval_minutes', 0)}[/yellow] min")
-        table.add_row("22", "Attach screenshot to status webhook", _yn(cfg.get("webhook_screenshot")))
-        table.add_row("23", "Discord ping target (e.g. @everyone)", cfg.get("webhook_ping") or "[dim]none[/dim]")
+        table.add_row("", "[bold blue]── BÁO CÁO DISCORD WEBHOOK ──[/bold blue]", "")
+        table.add_row("17", "Tên máy hiển thị trên Discord", cfg.get("device_name") or "[dim]chưa đặt[/dim]")
+        table.add_row("18", "Link Discord Webhook (theo dõi chính)", "[green]đã gắn[/green]" if cfg.get("webhook") else "[red]chưa có[/red]")
+        table.add_row("19", "Webhook riêng khi đổi acc", "[green]đã gắn[/green]" if cfg.get("webhook_change_url") else "[dim]dùng chung[/dim]")
+        table.add_row("20", "Webhook riêng báo lỗi / Captcha", "[green]đã gắn[/green]" if cfg.get("webhook_alert_url") else "[dim]dùng chung[/dim]")
+        table.add_row("21", "Gửi báo cáo định kỳ mỗi X phút (0=tắt)", f"[yellow]{cfg.get('webhook_interval_minutes', 0)}[/yellow] phút")
+        table.add_row("22", "Chụp ảnh màn hình gửi kèm báo cáo Discord", _yn(cfg.get("webhook_screenshot")))
+        table.add_row("23", "Tag người nhận thông báo (VD: @everyone)", cfg.get("webhook_ping") or "[dim]không[/dim]")
 
-        table.add_row("", "[bold blue]── WEB PANEL / HOT-FOLDER / STABILITY ──[/bold blue]", "")
-        table.add_row("24", "Web Control Panel auto-start", _yn(cfg.get("web_enabled", False)))
-        table.add_row("25", "Web Panel Host : Port", f"[cyan]{cfg.get('web_host', '127.0.0.1')}:{cfg.get('web_port', 8787)}[/cyan]")
-        table.add_row("26", "Web Panel API Token", "[green]set[/green]" if cfg.get("web_token") else "[dim]none (localhost)[/dim]")
-        table.add_row("27", "Download Hub hot-folder sync", _yn(cfg.get("download_hub_sync", True)))
-        table.add_row("28", "Auto-dismiss ANR / crash dialogs", _yn(cfg.get("auto_dismiss_anr", True)))
-        table.add_row("29", "Server-hop public on disconnect", _yn(cfg.get("server_hop_on_disconnect", False)))
-        table.add_row("30", "Error 264 action (cooldown/rotate)", f"[yellow]{cfg.get('error_264_action', 'cooldown')}[/yellow]")
+        table.add_row("", "[bold blue]── BẢNG WEB & CHỐNG TREO ──[/bold blue]", "")
+        table.add_row("24", "Tự mở Bảng Điều Khiển Web khi chạy tool", _yn(cfg.get("web_enabled", False)))
+        table.add_row("25", "Địa chỉ : Cổng Web", f"[cyan]{cfg.get('web_host', '127.0.0.1')}:{cfg.get('web_port', 8787)}[/cyan]")
+        table.add_row("26", "Mật khẩu truy cập Bảng Web", "[green]đã đặt[/green]" if cfg.get("web_token") else "[dim]không (chỉ trên máy)[/dim]")
+        table.add_row("27", "Tự hút Cookie & xuất file ở thư mục Download", _yn(cfg.get("download_hub_sync", True)))
+        table.add_row("28", "Tự đóng bảng lỗi 'Ứng dụng không phản hồi'", _yn(cfg.get("auto_dismiss_anr", True)))
+        table.add_row("29", "Tự nhảy server công khai khác khi mất kết nối", _yn(cfg.get("server_hop_on_disconnect", False)))
+        table.add_row("30", "Xử lý khi gặp lỗi 264 (chờ/đổi acc)", f"[yellow]{'đổi acc' if cfg.get('error_264_action') == 'rotate' else 'nghỉ chờ'}[/yellow]")
 
-        table.add_row("S", "[bold green]Save & apply (hot-reload daemon)[/bold green]", "")
-        table.add_row("X", "[bold red]Discard & back[/bold red]", "")
+        table.add_row("S", "[bold green]Lưu & áp dụng ngay[/bold green]", "")
+        table.add_row("X", "[bold red]Huỷ & quay lại[/bold red]", "")
         console.print(table)
 
-        ch = Prompt.ask("Select # (or S=save, X=discard)", default="X").strip().upper()
+        ch = Prompt.ask("Chọn số (hoặc S=lưu, X=quay lại)", default="X").strip().upper()
         if ch == "X":
             return 0
         if ch == "S":
@@ -1453,63 +1447,63 @@ def cmd_config(_args=None):
             if cfg.get("stay_awake"):
                 set_stay_awake(True)
             res = ipc_request("reload_config", timeout=1.5)
-            msg = "[green]Configuration saved & hot-reloaded daemon.[/green]" if res.get("ok") else "[green]Configuration saved.[/green]"
+            msg = "[green]Đã lưu cài đặt & áp dụng ngay cho tool đang chạy.[/green]" if res.get("ok") else "[green]Đã lưu cài đặt thành công.[/green]"
             console.print(msg)
             time.sleep(1)
             return 0
         if ch == "1":
-            cfg["device_name"] = Prompt.ask("Device name (blank=clear)", default=cfg.get("device_name") or "")
+            cfg["sort_tabs"] = not cfg.get("sort_tabs", True)
         elif ch == "2":
-            cfg["package_prefix"] = Prompt.ask("Package prefix (blank=auto)", default=cfg.get("package_prefix") or "")
-        elif ch == "3":
-            cfg["stay_awake"] = not cfg.get("stay_awake", False)
-        elif ch == "4":
-            cfg["auto_clean_ram_minutes"] = max(0, IntPrompt.ask("Auto clean RAM every X minutes (0=off)", default=int(cfg.get("auto_clean_ram_minutes") or 0)))
-        elif ch == "5":
-            cfg["change_acc_cus"] = not cfg.get("change_acc_cus", True)
-        elif ch == "6":
-            cfg["change_acc_bf"] = not cfg.get("change_acc_bf", False)
-        elif ch == "7":
-            _menu_change_config()
-        elif ch == "8":
-            cfg["auto_block_accounts"] = not cfg.get("auto_block_accounts", False)
-        elif ch == "9":
-            cfg["sort_tabs"] = not cfg.get("sort_tabs", False)
-        elif ch == "10":
             cfg["tiny_sort_tabs"] = not cfg.get("tiny_sort_tabs", False)
-        elif ch == "11":
+        elif ch == "3":
+            cfg["sort_tabs_interval_seconds"] = max(10, IntPrompt.ask("Chu kỳ tự xếp cửa sổ (giây, tối thiểu 10)", default=int(cfg.get("sort_tabs_interval_seconds") or 15)))
+        elif ch == "4":
             cfg["kill_all_on_crash"] = not cfg.get("kill_all_on_crash", False)
-        elif ch == "12":
+        elif ch == "5":
             cfg["focus_before_kill"] = not cfg.get("focus_before_kill", True)
-        elif ch == "13":
+        elif ch == "6":
+            cfg["stay_awake"] = not cfg.get("stay_awake", False)
+        elif ch == "7":
+            cfg["auto_clean_ram_minutes"] = max(0, IntPrompt.ask("Tự dọn RAM mỗi X phút (0=tắt)", default=int(cfg.get("auto_clean_ram_minutes") or 0)))
+        elif ch == "8":
+            cfg["change_acc_cus"] = not cfg.get("change_acc_cus", True)
+        elif ch == "9":
+            cfg["change_acc_bf"] = not cfg.get("change_acc_bf", False)
+        elif ch == "10":
+            _menu_change_config()
+        elif ch == "11":
+            cfg["auto_block_accounts"] = not cfg.get("auto_block_accounts", False)
+        elif ch == "12":
             cfg["sync_shared_scripts"] = not cfg.get("sync_shared_scripts", True)
+        elif ch == "13":
+            cfg["package_prefix"] = Prompt.ask("Tiền tố tên gói app (để trống=tự nhận)", default=cfg.get("package_prefix") or "")
         elif ch == "14":
-            cfg["stagger_launch_seconds"] = max(0, IntPrompt.ask("Stagger launch delay (sec)", default=int(cfg.get("stagger_launch_seconds") or 8)))
+            cfg["stagger_launch_seconds"] = max(0, IntPrompt.ask("Khoảng nghỉ giữa mỗi lần mở tab (giây)", default=int(cfg.get("stagger_launch_seconds") or 8)))
         elif ch == "15":
-            cfg["open_delay_seconds"] = max(0, IntPrompt.ask("Splash -> protocol open delay (sec)", default=int(cfg.get('open_delay_seconds') or 2)))
+            cfg["open_delay_seconds"] = max(0, IntPrompt.ask("Chờ màn hình chờ -> vào game (giây)", default=int(cfg.get("open_delay_seconds") or 2)))
         elif ch == "16":
-            cfg["sleep_after_kill_seconds"] = max(0, IntPrompt.ask("Sleep after kill (sec)", default=int(cfg.get('sleep_after_kill_seconds') or 2)))
+            cfg["sleep_after_kill_seconds"] = max(0, IntPrompt.ask("Nghỉ sau khi tắt app (giây)", default=int(cfg.get("sleep_after_kill_seconds") or 2)))
         elif ch == "17":
-            cfg["sort_tabs_interval_seconds"] = max(10, IntPrompt.ask("Tab sort interval (sec, min 10)", default=int(cfg.get('sort_tabs_interval_seconds') or 20)))
+            cfg["device_name"] = Prompt.ask("Tên máy hiển thị Discord (trống=xoá)", default=cfg.get("device_name") or "")
         elif ch == "18":
-            cfg["webhook"] = Prompt.ask("Monitor Webhook URL (blank=clear)", default=cfg.get("webhook") or "")
+            cfg["webhook"] = Prompt.ask("Link Discord Webhook chính (trống=xoá)", default=cfg.get("webhook") or "")
         elif ch == "19":
-            cfg["webhook_change_url"] = Prompt.ask("Account Change Webhook URL (blank=inherit)", default=cfg.get("webhook_change_url") or "")
+            cfg["webhook_change_url"] = Prompt.ask("Link Webhook đổi acc (trống=dùng chung)", default=cfg.get("webhook_change_url") or "")
         elif ch == "20":
-            cfg["webhook_alert_url"] = Prompt.ask("Alert/Challenge Webhook URL (blank=inherit)", default=cfg.get("webhook_alert_url") or "")
+            cfg["webhook_alert_url"] = Prompt.ask("Link Webhook cảnh báo (trống=dùng chung)", default=cfg.get("webhook_alert_url") or "")
         elif ch == "21":
-            cfg["webhook_interval_minutes"] = max(0, IntPrompt.ask("Webhook status interval (min, 0=off)", default=int(cfg.get("webhook_interval_minutes") or 0)))
+            cfg["webhook_interval_minutes"] = max(0, IntPrompt.ask("Gửi báo cáo định kỳ mỗi X phút (0=tắt)", default=int(cfg.get("webhook_interval_minutes") or 0)))
         elif ch == "22":
             cfg["webhook_screenshot"] = not cfg.get("webhook_screenshot", False)
         elif ch == "23":
-            cfg["webhook_ping"] = Prompt.ask("Discord ping target (e.g. @everyone, blank=none)", default=cfg.get("webhook_ping") or "")
+            cfg["webhook_ping"] = Prompt.ask("Tag Discord khi báo lỗi (VD: @everyone, trống=không)", default=cfg.get("webhook_ping") or "")
         elif ch == "24":
             cfg["web_enabled"] = not cfg.get("web_enabled", False)
         elif ch == "25":
-            cfg["web_host"] = Prompt.ask("Web bind host (127.0.0.1 or 0.0.0.0)", default=cfg.get("web_host") or "127.0.0.1").strip()
-            cfg["web_port"] = max(1, min(65535, IntPrompt.ask("Web port", default=int(cfg.get("web_port") or 8787))))
+            cfg["web_host"] = Prompt.ask("Địa chỉ Web (127.0.0.1=trên máy, 0.0.0.0=LAN)", default=cfg.get("web_host") or "127.0.0.1").strip()
+            cfg["web_port"] = max(1, min(65535, IntPrompt.ask("Cổng Web", default=int(cfg.get("web_port") or 8787))))
         elif ch == "26":
-            cfg["web_token"] = Prompt.ask("Web API Bearer token (blank=disable)", default=cfg.get("web_token") or "").strip()
+            cfg["web_token"] = Prompt.ask("Mật khẩu Web (trống=không đặt)", default=cfg.get("web_token") or "").strip()
         elif ch == "27":
             cfg["download_hub_sync"] = not cfg.get("download_hub_sync", True)
         elif ch == "28":
@@ -1517,47 +1511,102 @@ def cmd_config(_args=None):
         elif ch == "29":
             cfg["server_hop_on_disconnect"] = not cfg.get("server_hop_on_disconnect", False)
         elif ch == "30":
-            cfg["error_264_action"] = Prompt.ask("Error 264 action", choices=["cooldown", "rotate"], default=cfg.get("error_264_action") or "cooldown")
+            cfg["error_264_action"] = Prompt.ask("Xử lý lỗi 264 (cooldown=nghỉ chờ, rotate=đổi acc)", choices=["cooldown", "rotate"], default=cfg.get("error_264_action") or "cooldown")
     return 0
 
 
 # ───────────────────────── Interactive Menu ─────────────────────────
+def _ensure_target_configured(cfg):
+    """Prompt user for Game ID / VIP link if enabled tabs still have no target or place_id."""
+    enabled_insts = [i for i in cfg.get("instances") or [] if i.get("enabled", True)]
+    if not enabled_insts:
+        console.print("[yellow]Chưa có Tab Roblox nào được bật. Hãy chọn 'Quản lý Tab Roblox' để thêm tab.[/yellow]")
+        time.sleep(1.5)
+        return False
+
+    missing = []
+    for inst in enabled_insts:
+        if (inst.get("target") or "").strip():
+            continue
+        try:
+            prof = load_profile(inst.get("profile", "default"))
+        except FileNotFoundError:
+            prof = dict(DEFAULT_PROFILE)
+        if (prof.get("private_link") or "").strip():
+            continue
+        if int(prof.get("place_id") or 0) > 0:
+            continue
+        missing.append(inst)
+
+    if not missing:
+        return True
+
+    console.print("\n[yellow]⚠ Bạn chưa điền ID Game hoặc Link Server VIP (VD: 2753915549 cho Blox Fruits).[/yellow]")
+    raw = Prompt.ask("Nhập ID Game hoặc Link Server VIP ngay để bắt đầu (để trống = huỷ)", default="").strip()
+    if not raw:
+        return False
+
+    parsed = parse_target(raw)
+    if not parsed["place_id"] and not parsed["link_code"] and not parsed["share_code"]:
+        console.print("[red]Link hoặc ID Game chưa đúng định dạng.[/red]")
+        time.sleep(1.2)
+        return False
+
+    for inst in missing:
+        inst["target"] = raw
+    save_config(cfg)
+    try:
+        def_prof = load_profile("default")
+        if int(def_prof.get("place_id") or 0) <= 0 and not (def_prof.get("private_link") or "").strip():
+            if parsed["place_id"]:
+                def_prof["place_id"] = int(parsed["place_id"])
+            if parsed["link_code"] or parsed["share_code"] or "http" in raw:
+                def_prof["private_link"] = raw
+            def_prof.pop("name", None)
+            save_json(os.path.join(PROFILES, "default.json"), def_prof)
+    except Exception:
+        pass
+    console.print("[green]Đã gắn Link Game thành công![/green]")
+    return True
+
+
 def _menu_instances():
     while True:
         cfg = load_config()
+        sync_installed_instances(cfg, Store(), auto_add=False, prune_uninstalled=True, persist=True)
         console.clear()
-        table = Table(title="Instances & Per-Clone Targets", box=box.ROUNDED)
+        table = Table(title="🎮 Danh sách Tab Roblox & Link Server", box=box.ROUNDED)
         table.add_column("#", justify="right", style="yellow")
-        table.add_column("Name", style="cyan")
-        table.add_column("Package")
-        table.add_column("Profile", style="magenta")
-        table.add_column("Override Target", style="green")
-        table.add_column("Queue", justify="center")
-        table.add_column("Enabled", justify="center")
+        table.add_column("Tên Tab", style="cyan")
+        table.add_column("Gói App")
+        table.add_column("Cấu hình", style="magenta")
+        table.add_column("Link Server / ID Game", style="green")
+        table.add_column("Đổi acc", justify="center")
+        table.add_column("Trạng thái", justify="center")
         for idx, i in enumerate(cfg["instances"], 1):
             table.add_row(
                 str(idx),
                 i["name"],
                 i["package"],
                 i.get("profile", "default"),
-                (i.get("target") or "-")[:24],
-                "yes" if i.get("use_cookie_queue", True) else "no",
-                "[green]ON[/]" if i.get("enabled", True) else "[red]OFF[/]",
+                (i.get("target") or "(theo cấu hình)")[:24],
+                "Có" if i.get("use_cookie_queue", True) else "Không",
+                "[green]Bật[/]" if i.get("enabled", True) else "[red]Tắt[/]",
             )
         console.print(table)
-        console.print("\n[1] Auto-detect & add  [2] Add manual  [3] Assign profile  [4] Set target link  [5] Set 1 link for ALL  [6] Toggle ON/OFF  [7] Delete  [0] Back")
-        c = Prompt.ask("Select", choices=["0", "1", "2", "3", "4", "5", "6", "7"], default="0")
+        console.print("\n[1] Tự quét & đồng bộ Tab  [2] Thêm thủ công  [3] Chọn cấu hình  [4] Gắn link cho 1 Tab  [5] Gắn 1 link cho TẤT CẢ  [6] Bật/Tắt Tab  [7] Xoá Tab  [0] Quay lại")
+        c = Prompt.ask("Chọn", choices=["0", "1", "2", "3", "4", "5", "6", "7"], default="0")
         if c == "0":
             return
         if c == "1":
             cmd_detect(argparse.Namespace(add=True))
-            Prompt.ask("Press Enter", default="")
+            Prompt.ask("Bấm Enter để tiếp tục", default="")
         elif c == "2":
-            name = Prompt.ask("Instance name")
-            pkg = Prompt.ask("Android package name")
+            name = Prompt.ask("Tên Tab")
+            pkg = Prompt.ask("Tên gói Android (package)")
             profs = list_profiles()
-            prof = Prompt.ask("Profile", choices=profs, default=profs[0] if profs else "default")
-            use_q = Confirm.ask("Use cookie rotation queue?", default=True)
+            prof = Prompt.ask("Cấu hình", choices=profs, default=profs[0] if profs else "default")
+            use_q = Confirm.ask("Dùng kho Cookie để tự đổi acc?", default=True)
             cfg["instances"].append({
                 "name": name, "package": pkg, "profile": prof, "target": "",
                 "workspace": DEFAULT_WORKSPACE, "autoexec": DEFAULT_AUTOEXEC,
@@ -1565,28 +1614,28 @@ def _menu_instances():
             })
             save_config(cfg)
         elif c == "3" and cfg["instances"]:
-            idx = IntPrompt.ask("Instance #", default=1) - 1
+            idx = IntPrompt.ask("Số thứ tự Tab #", default=1) - 1
             if 0 <= idx < len(cfg["instances"]):
                 profs = list_profiles()
-                cfg["instances"][idx]["profile"] = Prompt.ask("Profile", choices=profs, default=profs[0])
+                cfg["instances"][idx]["profile"] = Prompt.ask("Cấu hình", choices=profs, default=profs[0])
                 save_config(cfg)
         elif c == "4" and cfg["instances"]:
-            idx = IntPrompt.ask("Instance #", default=1) - 1
+            idx = IntPrompt.ask("Số thứ tự Tab #", default=1) - 1
             if 0 <= idx < len(cfg["instances"]):
-                t = Prompt.ask("Game ID / VIP / Share link (blank=use profile)", default=cfg["instances"][idx].get("target") or "")
+                t = Prompt.ask("ID Game / Link VIP / Link Share (để trống = dùng mặc định)", default=cfg["instances"][idx].get("target") or "")
                 cfg["instances"][idx]["target"] = t.strip()
                 save_config(cfg)
         elif c == "5" and cfg["instances"]:
-            t = Prompt.ask("Game ID / VIP / Share link for ALL instances")
+            t = Prompt.ask("Nhập ID Game / Link VIP áp dụng cho TẤT CẢ Tab")
             cmd_links(argparse.Namespace(action="set-all", target=t.strip(), instance=None))
             time.sleep(1)
         elif c == "6" and cfg["instances"]:
-            idx = IntPrompt.ask("Instance #", default=1) - 1
+            idx = IntPrompt.ask("Số thứ tự Tab #", default=1) - 1
             if 0 <= idx < len(cfg["instances"]):
                 cfg["instances"][idx]["enabled"] = not cfg["instances"][idx].get("enabled", True)
                 save_config(cfg)
         elif c == "7" and cfg["instances"]:
-            idx = IntPrompt.ask("Instance # to delete", default=1) - 1
+            idx = IntPrompt.ask("Số thứ tự Tab cần xoá #", default=1) - 1
             if 0 <= idx < len(cfg["instances"]):
                 cfg["instances"].pop(idx)
                 save_config(cfg)
@@ -1596,32 +1645,32 @@ def _menu_profiles():
     while True:
         console.clear()
         profs = list_profiles()
-        table = Table(title="Game Profiles", box=box.ROUNDED)
-        table.add_column("Name", style="cyan")
-        table.add_column("Place ID")
-        table.add_column("Mode", style="yellow")
-        table.add_column("VIP Link")
-        table.add_column("Rejoin (min)", justify="right")
-        table.add_column("Rotate On")
+        table = Table(title="🎯 Cấu hình Game & Tự Đổi Acc", box=box.ROUNDED)
+        table.add_column("Tên cấu hình", style="cyan")
+        table.add_column("ID Game")
+        table.add_column("Kiểu kiểm tra", style="yellow")
+        table.add_column("Link VIP")
+        table.add_column("Vào lại (phút)", justify="right")
+        table.add_column("Điều kiện đổi acc")
         for p in profs:
             d = load_profile(p)
             table.add_row(
                 p,
                 str(d.get("place_id") or "-"),
-                str(d.get("check_method") or "executor"),
-                "yes" if d.get("private_link") else "-",
+                str(d.get("check_method") or "hybrid"),
+                "Có" if d.get("private_link") else "-",
                 str(d.get("rejoin_after_minutes")),
                 ", ".join(d.get("rotate_on") or [])[:35],
             )
         console.print(table)
-        console.print("\n[1] Create / Edit profile  [2] View profile JSON  [0] Back")
-        c = Prompt.ask("Select", choices=["0", "1", "2"], default="0")
+        console.print("\n[1] Tạo / Sửa cấu hình  [2] Xem chi tiết JSON  [0] Quay lại")
+        c = Prompt.ask("Chọn", choices=["0", "1", "2"], default="0")
         if c == "0":
             return
         if c == "1":
-            name = Prompt.ask("Profile name", default="default")
+            name = Prompt.ask("Tên cấu hình", default="default")
             base = load_profile(name) if name in profs else dict(DEFAULT_PROFILE)
-            target = Prompt.ask("Game ID or VIP/Share Link", default=base.get("private_link") or str(base.get("place_id") or ""))
+            target = Prompt.ask("ID Game hoặc Link VIP/Share", default=base.get("private_link") or str(base.get("place_id") or ""))
             parsed = parse_target(target)
             if parsed["place_id"]:
                 base["place_id"] = int(parsed["place_id"])
@@ -1629,30 +1678,30 @@ def _menu_profiles():
                 base["private_link"] = target
             else:
                 base["private_link"] = ""
-            base["check_method"] = Prompt.ask("Check method", choices=["hybrid", "executor", "online"], default=base.get("check_method") or "hybrid")
-            base["rejoin_after_minutes"] = IntPrompt.ask("Mandatory rejoin after X minutes (0=disable)", default=int(base.get("rejoin_after_minutes") or 30))
-            base["rotate_after_minutes"] = IntPrompt.ask("Scheduled rotate account every X minutes (0=disable)", default=int(base.get("rotate_after_minutes") or 0))
-            base["heartbeat_timeout"] = IntPrompt.ask("Heartbeat stale timeout (sec)", default=int(base.get("heartbeat_timeout") or 45))
-            base["launch_grace"] = IntPrompt.ask("Launch grace period (sec)", default=int(base.get("launch_grace") or 90))
-            base["on_challenge"] = Prompt.ask("On captcha/faceid/lock", choices=["pause", "rotate", "ignore"], default=base.get("on_challenge") or "pause")
-            base["open_splash_first"] = Confirm.ask("Use 2-step ActivitySplash -> ProtocolLaunch?", default=bool(base.get("open_splash_first", False)))
-            rot = Prompt.ask("Rotate conditions (comma separated, e.g. status:done,elapsed_account:120m,stat:level>=100)", default=",".join(base.get("rotate_on") or ["status:done"]))
+            base["check_method"] = Prompt.ask("Cách kiểm tra (hybrid=tổng hợp, executor=script, online=chỉ check mạng)", choices=["hybrid", "executor", "online"], default=base.get("check_method") or "hybrid")
+            base["rejoin_after_minutes"] = IntPrompt.ask("Tự vào lại game định kỳ sau X phút (0=tắt)", default=int(base.get("rejoin_after_minutes") or 30))
+            base["rotate_after_minutes"] = IntPrompt.ask("Hẹn giờ đổi acc sau X phút (0=tắt)", default=int(base.get("rotate_after_minutes") or 0))
+            base["heartbeat_timeout"] = IntPrompt.ask("Thời gian mất tín hiệu script tối đa (giây)", default=int(base.get("heartbeat_timeout") or 45))
+            base["launch_grace"] = IntPrompt.ask("Thời gian chờ mở game lúc mới bật (giây)", default=int(base.get("launch_grace") or 90))
+            base["on_challenge"] = Prompt.ask("Khi gặp Captcha / Xác minh (pause=tạm dừng, rotate=đổi acc)", choices=["pause", "rotate", "ignore"], default=base.get("on_challenge") or "pause")
+            base["open_splash_first"] = Confirm.ask("Mở màn hình chờ trước khi vào link game?", default=bool(base.get("open_splash_first", False)))
+            rot = Prompt.ask("Điều kiện đổi acc (cách nhau dấu phẩy, VD: status:done,elapsed_account:120m)", default=",".join(base.get("rotate_on") or ["status:done"]))
             base["rotate_on"] = [x.strip() for x in rot.split(",") if x.strip()]
-            rules_raw = Prompt.ask("Extra rules (comma separated, e.g. kicked -> rejoin)", default=",".join(x for x in (base.get("rules") or []) if isinstance(x, str)))
+            rules_raw = Prompt.ask("Quy tắc thêm (cách nhau dấu phẩy, VD: kicked -> rejoin)", default=",".join(x for x in (base.get("rules") or []) if isinstance(x, str)))
             base["rules"] = [x.strip() for x in rules_raw.split(",") if x.strip()]
-            base["lua"] = Prompt.ask("Optional custom Lua file in profiles/lua/ (blank=none)", default=base.get("lua") or "")
-            base["clear_cache_on_rejoin"] = Confirm.ask("Clear app cache on every rejoin?", default=bool(base.get("clear_cache_on_rejoin", False)))
-            base["max_ram_mb"] = IntPrompt.ask("Auto-rejoin if instance RAM exceeds MB (0=disable)", default=int(base.get("max_ram_mb") or 0))
-            base["fps_cap"] = IntPrompt.ask("Force FPS cap + low graphics on start (0=disable)", default=int(base.get("fps_cap") or 0))
-            base["window_mode"] = Prompt.ask("Window mode", choices=["default", "freeform"], default=base.get("window_mode") or "default")
+            base["lua"] = Prompt.ask("File Lua riêng trong profiles/lua/ (trống=không)", default=base.get("lua") or "")
+            base["clear_cache_on_rejoin"] = Confirm.ask("Xoá cache app mỗi lần vào lại game?", default=bool(base.get("clear_cache_on_rejoin", False)))
+            base["max_ram_mb"] = IntPrompt.ask("Tự vào lại nếu RAM tab vượt quá MB (0=tắt)", default=int(base.get("max_ram_mb") or 0))
+            base["fps_cap"] = IntPrompt.ask("Giới hạn FPS + giảm đồ họa khi mở (0=tắt)", default=int(base.get("fps_cap") or 0))
+            base["window_mode"] = Prompt.ask("Kiểu cửa sổ (freeform=chia ô nổi, default=mặc định)", choices=["freeform", "default"], default=base.get("window_mode") or "freeform")
             base.pop("name", None)
             save_json(os.path.join(PROFILES, f"{name}.json"), base)
-            console.print(f"[green]Saved profile '{name}'[/green]")
+            console.print(f"[green]Đã lưu cấu hình '{name}'[/green]")
             time.sleep(1)
         elif c == "2":
-            name = Prompt.ask("Profile name", choices=profs, default=profs[0] if profs else "default")
+            name = Prompt.ask("Tên cấu hình", choices=profs, default=profs[0] if profs else "default")
             console.print_json(json.dumps(load_profile(name)))
-            Prompt.ask("Press Enter", default="")
+            Prompt.ask("Bấm Enter để tiếp tục", default="")
 
 
 def _menu_cookies():
@@ -1660,13 +1709,13 @@ def _menu_cookies():
     while True:
         console.clear()
         cnt = store.counts()
-        console.print(Panel(f"Queue: [cyan]{cnt['queue']}[/]  |  Done: [green]{cnt['done']}[/]  |  Dead: [red]{cnt['dead']}[/]", title="Accounts & Cookies"))
-        console.print("[1] Paste cookie(s) (cookie or user:pass:cookie)  [2] Validate queue  [3] Auto-extract cookies  [4] Inject next cookie  [5] View switched/*.txt  [6] Fix/Sync cookies  [0] Back")
-        c = Prompt.ask("Select", choices=["0", "1", "2", "3", "4", "5", "6"], default="0")
+        console.print(Panel(f"Kho Acc chờ: [cyan]{cnt['queue']}[/]  |  Đã cày xong: [green]{cnt['done']}[/]  |  Acc lỗi/die: [red]{cnt['dead']}[/]", title="🍪 Quản lý Tài khoản & Cookie"))
+        console.print("[1] Dán thêm Cookie (cookie hoặc user:pass:cookie)  [2] Lọc kiểm tra Acc sống/chết  [3] Lấy Cookie đang đăng nhập trên máy  [4] Bơm Cookie kế tiếp vào Tab  [5] Xem acc đã phân loại  [6] Sửa / Đồng bộ đăng nhập  [0] Quay lại")
+        c = Prompt.ask("Chọn", choices=["0", "1", "2", "3", "4", "5", "6"], default="0")
         if c == "0":
             return
         if c == "1":
-            console.print("[dim]Paste cookies or user:pass:cookie (one per line, empty line to finish):[/dim]")
+            console.print("[dim]Dán cookie hoặc user:pass:cookie (mỗi acc 1 dòng, bấm Enter dòng trống để hoàn tất):[/dim]")
             lines = []
             while True:
                 line = input()
@@ -1674,34 +1723,35 @@ def _menu_cookies():
                     break
                 lines.append(line)
             n = store.add_cookies("\n".join(lines))
-            console.print(f"[green]Added {n} cookie(s)[/green]")
+            console.print(f"[green]Đã thêm {n} cookie vào kho chờ[/green]")
             time.sleep(1)
         elif c == "2":
-            cmd_cookies(argparse.Namespace(action="validate"))
-            Prompt.ask("Press Enter", default="")
+            clean = Confirm.ask("Tự động loại bỏ acc die/ban/captcha khỏi hàng chờ luôn không?", default=True)
+            cmd_cookies(argparse.Namespace(action="validate", clean=clean))
+            Prompt.ask("Bấm Enter để tiếp tục", default="")
         elif c == "3":
             rc = cmd_cookies(argparse.Namespace(action="extract", package=None, save=False, out=None, export=False, assign=False, show=False))
             if rc == 0:
-                save_q = Confirm.ask("Save valid cookies to cookies.txt queue?", default=False)
-                export_f = Confirm.ask(f"Export to {DEFAULT_EXPORT_PATH}?", default=False)
-                bind_inst = Confirm.ask("Bind each cookie to its matching instance?", default=False)
+                save_q = Confirm.ask("Lưu các cookie sống vào kho chờ (cookies.txt)?", default=False)
+                export_f = Confirm.ask(f"Xuất ra file {DEFAULT_EXPORT_PATH}?", default=False)
+                bind_inst = Confirm.ask("Gắn từng cookie vào đúng Tab tương ứng?", default=False)
                 if save_q or export_f or bind_inst:
                     out_file = DEFAULT_EXPORT_PATH if export_f else None
                     cmd_cookies(argparse.Namespace(action="extract", package=None, save=save_q, out=out_file, export=False, assign=bind_inst, show=False))
-            Prompt.ask("Press Enter", default="")
+            Prompt.ask("Bấm Enter để tiếp tục", default="")
         elif c == "4":
             cfg = load_config()
             if not cfg["instances"]:
                 continue
-            pkg = Prompt.ask("Package", default=cfg["instances"][0]["package"])
+            pkg = Prompt.ask("Gói App nhận cookie", default=cfg["instances"][0]["package"])
             ck = store.pop()
             if not ck:
-                console.print("[red]Queue is empty[/red]")
+                console.print("[red]Kho Cookie đang trống[/red]")
                 time.sleep(1)
                 continue
             st, uid, uname = whoami(ck)
             if st != "ok":
-                console.print(f"[red]Cookie status={st}[/red]")
+                console.print(f"[red]Cookie lỗi trạng thái: {st}[/red]")
                 if st == "dead":
                     store.add_dead("?", ck, "manual_inject_dead")
                 else:
@@ -1711,18 +1761,22 @@ def _menu_cookies():
             force_stop(pkg)
             time.sleep(1)
             ok = write_app_cookie(pkg, ck, uid, uname)
-            console.print(f"[{'green' if ok else 'red'}]Inject {uname} ({uid}): {'OK' if ok else 'FAILED'}[/]")
+            console.print(f"[{'green' if ok else 'red'}]Bơm acc {uname} ({uid}): {'THÀNH CÔNG' if ok else 'THẤT BẠI'}[/]")
             time.sleep(1.5)
         elif c == "5":
             cmd_cookies(argparse.Namespace(action="switched"))
-            Prompt.ask("Press Enter", default="")
+            Prompt.ask("Bấm Enter để tiếp tục", default="")
         elif c == "6":
-            donor = Prompt.ask("Donor package to clone cookie from (blank=sync appStorage only)", default="")
+            donor = Prompt.ask("Gói app mẫu để chép sang máy khác (trống = chỉ đồng bộ lại tên acc)", default="")
             cmd_cookies(argparse.Namespace(action="fix", donor=donor.strip() or None))
-            Prompt.ask("Press Enter", default="")
+            Prompt.ask("Bấm Enter để tiếp tục", default="")
 
 
 def _menu_start():
+    cfg = load_config()
+    sync_installed_instances(cfg, Store(), auto_add=True, prune_uninstalled=True, persist=True)
+    if not _ensure_target_configured(cfg):
+        return
     cfg = load_config()
     store = Store()
     from rjcore import Logger
@@ -1731,7 +1785,7 @@ def _menu_start():
     try:
         mgr.start()
     except Exception as e:
-        console.print(f"[red]Cannot start: {e}[/red]")
+        console.print(f"[red]Không thể khởi động: {e}[/red]")
         time.sleep(2)
         return
 
@@ -1745,7 +1799,7 @@ def _menu_start():
     except KeyboardInterrupt:
         pass
     mgr.stop()
-    console.print("[yellow]Stopped.[/yellow]")
+    console.print("[yellow]Đã dừng Auto Rejoin.[/yellow]")
     time.sleep(1)
 
 
@@ -1755,26 +1809,26 @@ def _menu_scripts():
         execs = scan_executor_dirs()
         ae_dir = execs[0]["autoexec"] if execs else DEFAULT_AUTOEXEC
         cmd_scripts(argparse.Namespace(action="list", autoexec=ae_dir))
-        console.print("\n[1] Toggle script ON/OFF  [2] Add script from file  [3] Delete script  [4] Deploy heartbeat to ALL executors  [0] Back")
-        c = Prompt.ask("Select", choices=["0", "1", "2", "3", "4"], default="0")
+        console.print("\n[1] Bật/Tắt script  [2] Thêm script từ file  [3] Xoá script  [4] Cài script kết nối cho TẤT CẢ Executor  [0] Quay lại")
+        c = Prompt.ask("Chọn", choices=["0", "1", "2", "3", "4"], default="0")
         if c == "0":
             return
         try:
             if c == "1":
-                name = Prompt.ask("Script filename (e.g. farm.lua)")
+                name = Prompt.ask("Tên file script (VD: farm.lua)")
                 cmd_scripts(argparse.Namespace(action="toggle", name=name, autoexec=ae_dir))
             elif c == "2":
-                name = Prompt.ask("Target filename (e.g. farm.lua)")
-                src = Prompt.ask("Source .lua file path")
+                name = Prompt.ask("Tên file muốn lưu (VD: farm.lua)")
+                src = Prompt.ask("Đường dẫn file .lua nguồn")
                 cmd_scripts(argparse.Namespace(action="add", name=name, file=src, code=None, autoexec=ae_dir))
             elif c == "3":
-                name = Prompt.ask("Script filename to delete")
+                name = Prompt.ask("Tên file script cần xoá")
                 cmd_scripts(argparse.Namespace(action="delete", name=name, autoexec=ae_dir))
             elif c == "4":
                 cmd_deploy_lua(argparse.Namespace(autoexec=ae_dir, profile=None, all=True))
         except Exception as e:
             console.print(f"[red]{e}[/red]")
-        Prompt.ask("Press Enter", default="")
+        Prompt.ask("Bấm Enter để tiếp tục", default="")
 
 
 def _menu_optimizer():
@@ -1783,12 +1837,12 @@ def _menu_optimizer():
         st = get_system_stats()
         console.print(Panel(
             f"CPU: [cyan]{st['cpu_pct']:.0f}%[/]  |  RAM: [cyan]{st['ram_used_mb']:.0f}/{st['ram_total_mb']:.0f}MB ({st['ram_pct']:.0f}%)[/]  |  "
-            f"Disk Free: [cyan]{st['disk_free_gb']}/{st['disk_total_gb']}GB[/]  |  Load: {st['load_1m']}",
-            title="Window Tab Sorter, Optimizer & Cleaner",
+            f"Bộ nhớ trống: [cyan]{st['disk_free_gb']}/{st['disk_total_gb']}GB[/]  |  Tải máy: {st['load_1m']}",
+            title="🪟 Xếp Cửa Sổ, Giảm Lag & Dọn Máy",
             border_style="green",
         ))
-        console.print("[1] Sort Roblox Tabs (Grid)  [2] Tiny Sort Tabs (Smallest Tiles)  [3] Open All Tabs  [4] Kill Mode  [5] Clear Cache  [6] Low-Graphics + FPS Cap  [7] Cloud Tune (No Anim + Doze)  [8] Logout All Packages  [0] Back")
-        c = Prompt.ask("Select", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8"], default="0")
+        console.print("[1] Chia ô cửa sổ Roblox (Lưới)  [2] Xếp cửa sổ thu nhỏ (Tiny)  [3] Mở tất cả Tab Roblox  [4] Tắt toàn bộ Tab (Kill Mode)  [5] Dọn bộ nhớ đệm (Cache)  [6] Giảm đồ họa + Khoá FPS  [7] Tối ưu máy Cloud (Tắt hiệu ứng + Chống ngủ)  [8] Đăng xuất toàn bộ Tab  [0] Quay lại")
+        c = Prompt.ask("Chọn", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8"], default="0")
         if c == "0":
             return
         if c == "1":
@@ -1802,14 +1856,14 @@ def _menu_optimizer():
         elif c == "5":
             cmd_optimize(argparse.Namespace(package=None, kill_all=False, clear_cache=True, fps=None, cloud_tune=False))
         elif c == "6":
-            fps = IntPrompt.ask("Target FPS cap", default=15)
+            fps = IntPrompt.ask("Giới hạn FPS mục tiêu", default=15)
             cmd_optimize(argparse.Namespace(package=None, kill_all=False, clear_cache=False, fps=fps, cloud_tune=False))
         elif c == "7":
             cmd_optimize(argparse.Namespace(package=None, kill_all=False, clear_cache=False, fps=None, cloud_tune=True))
         elif c == "8":
-            if Confirm.ask("Logout and remove cookies from ALL configured packages?", default=False):
+            if Confirm.ask("Đăng xuất và xoá cookie khỏi TẤT CẢ các Tab Roblox?", default=False):
                 cmd_tabs(argparse.Namespace(action="logout", package=None, call_api=False))
-        Prompt.ask("Press Enter", default="")
+        Prompt.ask("Bấm Enter để tiếp tục", default="")
 
 
 def _menu_daemon():
@@ -1817,62 +1871,75 @@ def _menu_daemon():
         console.clear()
         ping = ipc_request("ping", timeout=1.0)
         alive = ping.get("ok")
-        status_str = f"[green]RUNNING (pid={ping['result'].get('pid')})[/green]" if alive else "[dim]STOPPED[/dim]"
-        console.print(Panel(f"Background Daemon IPC: {status_str}\nSocket: {DEFAULT_IPC_SOCK}", title="Daemon & IPC Manager"))
-        console.print("[1] Start Daemon  [2] Attach Live Dashboard  [3] Stop Daemon  [4] Hot-Reload Config  [0] Back")
-        c = Prompt.ask("Select", choices=["0", "1", "2", "3", "4"], default="0")
+        status_str = f"[green]ĐANG TREO NGẦM (PID {ping['result'].get('pid')})[/green]" if alive else "[dim]ĐANG TẮT[/dim]"
+        console.print(Panel(f"Trạng thái chạy nền: {status_str}\n[dim]Chế độ này giúp tool tự động canh và vào lại game liên tục kể cả khi bạn đóng bảng này.[/dim]", title="🔄 Treo Ngầm 24/7 (Chạy Nền)"))
+        console.print("[1] Bật treo ngầm ngay  [2] Xem bảng theo dõi trực tiếp  [3] Tắt treo ngầm  [4] Áp dụng cài đặt mới  [0] Quay lại")
+        c = Prompt.ask("Chọn", choices=["0", "1", "2", "3", "4"], default="0")
         if c == "0":
             return
         if c == "1":
-            cmd_daemon(argparse.Namespace(action="start", profile=None, target=None, rejoin_min=None))
+            cfg = load_config()
+            sync_installed_instances(cfg, Store(), auto_add=True, prune_uninstalled=True, persist=True)
+            if _ensure_target_configured(cfg):
+                cmd_daemon(argparse.Namespace(action="start", profile=None, target=None, rejoin_min=None, web=bool(cfg.get("web_enabled"))))
         elif c == "2":
             cmd_daemon(argparse.Namespace(action="attach"))
         elif c == "3":
             cmd_daemon(argparse.Namespace(action="stop"))
         elif c == "4":
             cmd_daemon(argparse.Namespace(action="reload"))
-        Prompt.ask("Press Enter", default="")
+        Prompt.ask("Bấm Enter để tiếp tục", default="")
 
 
 def interactive_menu():
     while True:
         cfg = load_config()
-        cnt = Store().counts()
+        store = Store()
+        sync_installed_instances(cfg, store, auto_add=True, prune_uninstalled=True, persist=True)
+        cfg = load_config()
+        cnt = store.counts()
         st = get_system_stats()
         enabled = sum(1 for i in cfg["instances"] if i.get("enabled", True))
         ping = ipc_request("ping", timeout=0.6)
-        daemon_badge = "[green]ON[/]" if ping.get("ok") else "[dim]OFF[/]"
-        web_badge = f"[green]ON(:{cfg.get('web_port', 8787)})[/]" if cfg.get("web_enabled") else "[dim]OFF[/]"
+        bg_badge = "[green]ĐANG CHẠY[/]" if ping.get("ok") else "[dim]ĐANG TẮT[/]"
+        if cfg.get("tiny_sort_tabs"):
+            resize_badge = "[green]Thu nhỏ[/]"
+        elif cfg.get("sort_tabs", True):
+            resize_badge = "[green]Đang bật[/]"
+        else:
+            resize_badge = "[yellow]Đang tắt[/]"
+        web_badge = f"[green]Bật (:{cfg.get('web_port', 8787)})[/]" if cfg.get("web_enabled") else "[dim]Tắt[/]"
         console.clear()
         console.print(Panel(
-            f"[bold cyan]Roblox Multi-Instance Auto-Rejoin v4.0 Ultra (Hybrid + Web Panel + Hot-Folder)[/bold cyan]\n"
-            f"Root: {'[green]OK[/]' if has_root() else '[red]NO[/]'}  •  "
-            f"Daemon: {daemon_badge}  •  "
-            f"Web: {web_badge}  •  "
-            f"Instances: [cyan]{enabled}/{len(cfg['instances'])}[/]  •  "
-            f"Queue: [yellow]{cnt['queue']}[/]  Done: [green]{cnt['done']}[/]  Dead: [red]{cnt['dead']}[/]\n"
+            f"[bold cyan]🛠 BẢNG ĐIỀU KHIỂN AUTO REJOIN ROBLOX[/bold cyan]\n"
+            f"Quyền Root: {'[green]Đã cấp[/]' if has_root() else '[red]Chưa có[/]'}  •  "
+            f"Treo ngầm: {bg_badge}  •  "
+            f"Tự xếp cửa sổ: {resize_badge}  •  "
+            f"Bảng Web: {web_badge}\n"
+            f"Tab Roblox: [cyan]{enabled}/{len(cfg['instances'])} đang bật[/]  •  "
+            f"Kho Acc chờ: [yellow]{cnt['queue']}[/]  •  Đã cày xong: [green]{cnt['done']}[/]  •  Acc lỗi/die: [red]{cnt['dead']}[/]\n"
             f"CPU: [cyan]{st['cpu_pct']:.0f}%[/]  •  RAM: [cyan]{st['ram_used_mb']:.0f}/{st['ram_total_mb']:.0f}MB ({st['ram_pct']:.0f}%)[/]  •  "
-            f"Tool: [cyan]{st.get('tool_ram_mb', 0):.0f}MB[/]  •  Disk Free: [cyan]{st['disk_free_gb']}GB[/]",
+            f"Bộ nhớ trống: [cyan]{st['disk_free_gb']}GB[/]",
             border_style="bright_blue",
         ))
         menu = Table(box=box.ROUNDED, show_header=False)
-        menu.add_column(style="bold yellow", justify="center")
+        menu.add_column(style="bold yellow", justify="center", width=4)
         menu.add_column()
-        menu.add_row("1", "[green]Start Rejoin Monitor (Live Dashboard)[/green]")
-        menu.add_row("2", "Background Daemon & Attach (IPC)")
-        menu.add_row("3", "Quick Setup (Detect All Clones + Set Link + Sync Lua)")
-        menu.add_row("4", "Manage Instances & Per-Clone Server Links")
-        menu.add_row("5", "Manage Game Profiles & Rules (Hybrid/Executor/Online)")
-        menu.add_row("6", "Manage Accounts & Cookies (user:pass:cookie / Prune / Extract)")
-        menu.add_row("7", "Window Tab Sorter, Cloud Tune & Cleaner")
-        menu.add_row("8", "Autoexecute Script Manager (Multi-Executor + Shared)")
-        menu.add_row("9", "Download Hub / Import Shouko / Live Client Logs / Benchmark")
-        menu.add_row("10", "[cyan]Configuration (v4.0 Table + Web Panel + Hot-Folder)[/cyan]")
-        menu.add_row("11", "[magenta]Start Standalone Web Control Panel (:8787)[/magenta]")
-        menu.add_row("0", "[red]Exit[/red]")
+        menu.add_row("1", "[bold green]▶ Bắt đầu Auto Rejoin (Chạy ngay & xem bảng trực tiếp)[/bold green]")
+        menu.add_row("2", "🔄 Treo ngầm 24/7 (Chạy nền khi tắt bảng / Xem lại / Dừng tool)")
+        menu.add_row("3", "⚡ Cài đặt nhanh 1 bước (Nhận Tab + Gắn Link Game + Chép Script)")
+        menu.add_row("4", "🎮 Quản lý Tab Roblox & Link Server (ID Game / Link VIP)")
+        menu.add_row("5", "🍪 Quản lý Tài khoản & Cookie (Thêm acc / Lọc acc die / Lấy cookie)")
+        menu.add_row("6", "🎯 Tự Đổi Acc & Cấu hình Game (Blox Fruits / Kaitun / Hẹn giờ)")
+        menu.add_row("7", "🪟 Xếp Cửa Sổ & Giảm Lag (Chia ô / Thu nhỏ / Khoá FPS / Dọn RAM)")
+        menu.add_row("8", "📜 Quản lý Script Tự Chạy (Autoexec Delta / Codex / Arceus)")
+        menu.add_row("9", "🌐 Bảng Điều Khiển Web (:8787) & Báo cáo Discord Webhook")
+        menu.add_row("10", "🧰 Tiện ích mở rộng (Hút Cookie Download / Xem lỗi văng / Tự mở khi bật máy)")
+        menu.add_row("11", "[cyan]⚙ Cài đặt chung[/cyan]")
+        menu.add_row("0", "[red]✖ Thoát[/red]")
         console.print(menu)
 
-        choice = Prompt.ask("Choose", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"], default="1")
+        choice = Prompt.ask("Nhập lựa chọn", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"], default="1")
         if choice == "0":
             break
         if choice == "1":
@@ -1880,26 +1947,45 @@ def interactive_menu():
         elif choice == "2":
             _menu_daemon()
         elif choice == "3":
-            t = Prompt.ask("Game ID or VIP/Share link (blank=keep profile)", default="")
+            t = Prompt.ask("Nhập ID Game hoặc Link VIP/Share (để trống = giữ cũ)", default="")
             profs = list_profiles()
-            pr = Prompt.ask("Profile", choices=profs, default="default" if "default" in profs else profs[0])
+            pr = Prompt.ask("Chọn cấu hình", choices=profs, default="default" if "default" in profs else profs[0])
             cmd_quick_setup(argparse.Namespace(target=t, profile=pr, start=False))
             cmd_commands()
-            Prompt.ask("Press Enter", default="")
+            Prompt.ask("Bấm Enter để tiếp tục", default="")
         elif choice == "4":
             _menu_instances()
         elif choice == "5":
-            _menu_profiles()
-        elif choice == "6":
             _menu_cookies()
+        elif choice == "6":
+            sub_c = Prompt.ask(
+                "[1] Cấu hình Game & Tự đổi acc theo thời gian / cấp độ (Profiles)  [2] Điều kiện đổi acc Blox Fruits (config-change.json)  [0] Quay lại",
+                choices=["0", "1", "2"],
+                default="1",
+            )
+            if sub_c == "1":
+                _menu_profiles()
+            elif sub_c == "2":
+                _menu_change_config()
         elif choice == "7":
             _menu_optimizer()
         elif choice == "8":
             _menu_scripts()
         elif choice == "9":
+            sub_w = Prompt.ask(
+                "[1] Mở Bảng Điều Khiển Web (:8787)  [2] Gửi tin nhắn thử Discord Webhook  [0] Quay lại",
+                choices=["0", "1", "2"],
+                default="1",
+            )
+            if sub_w == "1":
+                cmd_web(argparse.Namespace(action="start", host=None, port=None, token=None))
+            elif sub_w == "2":
+                cmd_webhook_test(argparse.Namespace(screenshot=False))
+                Prompt.ask("Bấm Enter để tiếp tục", default="")
+        elif choice == "10":
             act = Prompt.ask(
-                "[1] Sync Download Hub  [2] Import Shouko/config-change  [3] Inspect Roblox Client Logs  [4] Benchmark  [5] GoFile APK",
-                choices=["1", "2", "3", "4", "5"],
+                "[1] Đồng bộ Cookie & File ở Download  [2] Nhập từ thư mục Shouko cũ  [3] Xem lỗi văng game Roblox  [4] Bật/Tắt tự chạy khi mở máy  [5] Đo tốc độ máy  [6] Tải APK từ GoFile",
+                choices=["1", "2", "3", "4", "5", "6"],
                 default="1",
             )
             if act == "1":
@@ -1909,15 +1995,16 @@ def interactive_menu():
             elif act == "3":
                 cmd_logs()
             elif act == "4":
+                b_act = Prompt.ask("Tự mở khi khởi động máy", choices=["enable", "disable", "status"], default="status")
+                cmd_boot(argparse.Namespace(action=b_act, profile=None, target=None, rejoin_min=None))
+            elif act == "5":
                 cmd_benchmark()
             else:
-                u = Prompt.ask("GoFile URL")
-                cmd_gofile(argparse.Namespace(url=u, password="", download=True, install=Confirm.ask("Auto-install APK if downloaded?", default=False)))
-            Prompt.ask("Press Enter", default="")
-        elif choice == "10":
-            cmd_config()
+                u = Prompt.ask("Dán link GoFile")
+                cmd_gofile(argparse.Namespace(url=u, password="", download=True, install=Confirm.ask("Tự cài APK sau khi tải xong?", default=False)))
+            Prompt.ask("Bấm Enter để tiếp tục", default="")
         elif choice == "11":
-            cmd_web(argparse.Namespace(action="start", host=None, port=None, token=None))
+            cmd_config()
 
 
 def build_parser():

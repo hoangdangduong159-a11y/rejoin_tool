@@ -39,10 +39,10 @@ RJ_TARGET=2753915549 SKIP_UPGRADE=1 . <(curl -sL https://raw.githubusercontent.c
 # Menu tương tác (chạy bằng root)
 su -c "export PATH=\$PATH:/data/data/com.termux/files/usr/bin && export TERM=xterm-256color && export TMPDIR=/data/data/com.termux/files/usr/tmp && export LD_LIBRARY_PATH=/data/data/com.termux/files/usr/lib && /data/data/com.termux/files/home/rejoin_tool/rejoin"
 
-# Chạy Auto-Rejoin kèm Web Dashboard (:8787)
+# Chạy Auto-Rejoin kèm Bảng Điều Khiển Web (:8787)
 rejoin run --dashboard --web
 
-# Chạy nền bằng Daemon IPC + Web Panel
+# Chế độ treo ngầm 24/7 + Bảng Web
 rejoin daemon start --web
 rejoin daemon attach
 rejoin daemon stop

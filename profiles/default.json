@@ -14,6 +14,7 @@
   ],
   "rules": [],
   "when_no_cookies": "stop",
+  "window_mode": "freeform",
   "lua": "",
   "launch_extra": ""
 }

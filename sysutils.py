@@ -285,6 +285,25 @@ def optimize_cloud_device(packages=None, disable_animations=True, whitelist_doze
 
 
 # ───────────────────────── window grid & tab sorter ─────────────────────────
+_FREEFORM_READY = False
+
+
+def ensure_freeform_support():
+    """Enable Android global freeform / resizable window flags once per process."""
+    global _FREEFORM_READY
+    if _FREEFORM_READY:
+        return True
+    rc, _, _ = su(
+        "settings put global enable_freeform_support 1; "
+        "settings put global force_resizable_activities 1",
+        8,
+    )
+    if rc == 0:
+        _FREEFORM_READY = True
+        return True
+    return False
+
+
 def get_screen_resolution():
     """Return (width, height) from `wm size`, preferring Override size."""
     rc, out, _ = su("wm size", 8)
@@ -298,39 +317,57 @@ def get_screen_resolution():
     return 1080, 1920
 
 
-def _parse_task_ids_from_text(text, packages):
+def _parse_stack_and_task_ids(text, packages):
+    """Parse {package: {'task_id': int, 'stack_id': int | None}} from `am stack list` / dumpsys."""
     results = {}
     if not text or not packages:
         return results
-    pkg_set = set(packages)
-    # Match lines containing taskId=123 or Task{... #123 ...} alongside a known package name
+    pkg_set = [p for p in packages if p]
+    pkg_patterns = {
+        p: re.compile(rf"(?<![A-Za-z0-9_.]){re.escape(p)}(?![A-Za-z0-9_.])")
+        for p in pkg_set
+    }
+    cur_stack_id = None
     for line in text.splitlines():
+        sm = re.search(r"\bStack\s+id\s*=\s*(\d+)", line)
+        if sm:
+            cur_stack_id = int(sm.group(1))
         matched_pkg = None
-        for p in pkg_set:
-            if re.search(rf"(?<![A-Za-z0-9_.]){re.escape(p)}(?![A-Za-z0-9_.])", line):
+        for p, pat in pkg_patterns.items():
+            if pat.search(line):
                 matched_pkg = p
                 break
-        if not matched_pkg:
+        if not matched_pkg or matched_pkg in results:
             continue
         m = (
             re.search(r"\btaskId\s*=\s*(\d+)", line)
             or re.search(r"\bTask\s+id\s*#?\s*(\d+)", line, re.IGNORECASE)
             or re.search(r"\bTask\{[^\n]*?#(\d+)\b", line)
-            or re.search(r"\bt(\d+)\b", line)
         )
         if m:
-            results[matched_pkg] = int(m.group(1))
+            results[matched_pkg] = {"task_id": int(m.group(1)), "stack_id": cur_stack_id}
     return results
 
 
-def get_package_task_ids(packages):
-    """Return {package: task_id} for currently open Android tasks."""
-    if not packages:
+def _parse_task_ids_from_text(text, packages):
+    parsed = _parse_stack_and_task_ids(text, packages)
+    return {p: info["task_id"] for p, info in parsed.items()}
+
+
+def get_package_task_ids(packages, running_only=False):
+    """Return {package: task_id} for open Android tasks (optionally filtered to live PIDs)."""
+    target_pkgs = [p for p in (packages or []) if p]
+    if not target_pkgs:
         return {}
+    if running_only:
+        usage = get_batch_pkg_usage(target_pkgs)
+        target_pkgs = [p for p in target_pkgs if usage.get(p, {}).get("pid") is not None]
+        if not target_pkgs:
+            return {}
     for cmd in ("am stack list", "am task list", "dumpsys activity activities"):
         rc, out, _ = su(cmd, 12)
         if rc == 0 and out:
-            found = _parse_task_ids_from_text(out, packages)
+            found = _parse_task_ids_from_text(out, target_pkgs)
             if found:
                 return found
     return {}
@@ -345,8 +382,14 @@ def calculate_grid_positions(count, width, height, tiny=False, top_inset=48):
     top_inset = max(0, min(int(top_inset), height // 4))
     usable_h = max(160, height - top_inset)
 
-    cols = max(1, math.ceil(math.sqrt(count)))
-    rows = max(1, math.ceil(count / cols))
+    if not tiny and count == 2:
+        if height > width:
+            cols, rows = 1, 2
+        else:
+            cols, rows = 2, 1
+    else:
+        cols = max(1, math.ceil(math.sqrt(count)))
+        rows = max(1, math.ceil(count / cols))
 
     rects = []
     if tiny:
@@ -374,29 +417,36 @@ def calculate_grid_positions(count, width, height, tiny=False, top_inset=48):
 
 
 def sort_roblox_tabs(packages, tiny=False):
-    """Arrange active Roblox/Delta tasks into a freeform grid (or tiny tiles). Returns resized count."""
-    tasks = get_package_task_ids(packages)
+    """Arrange active running Roblox/Delta tasks into a freeform grid (or tiny tiles). Returns resized count."""
+    ensure_freeform_support()
+    tasks = get_package_task_ids(packages, running_only=True)
     if not tasks:
         return 0
     w, h = get_screen_resolution()
     ordered_pkgs = [p for p in packages if p in tasks]
     rects = calculate_grid_positions(len(ordered_pkgs), w, h, tiny=tiny)
-    resized = 0
+    cmds = []
     for pkg, (l, t, r, b) in zip(ordered_pkgs, rects):
         tid = tasks[pkg]
-        rc, _, _ = su(f"am task resize {tid} {l} {t} {r} {b}", 10)
-        if rc == 0:
-            resized += 1
-    return resized
+        cmds.append(
+            f"am task resizeable {tid} 2 >/dev/null 2>&1; "
+            f"am task resize {tid} {l} {t} {r} {b} >/dev/null 2>&1 && echo RJ_RESIZED_OK"
+        )
+    rc, out, _ = su("; ".join(cmds), 15)
+    if rc == 0 and out:
+        return out.count("RJ_RESIZED_OK")
+    return 0
 
 
 def focus_before_kill(target_pkg):
     """Shift Android window focus to Termux before stopping target_pkg to avoid launcher glitches."""
-    tasks = get_package_task_ids(["com.termux", target_pkg])
-    tid_termux = tasks.get("com.termux")
-    if tid_termux and target_pkg in tasks:
-        su(f"am task focus {tid_termux}", 8)
-        return True
+    tasks = get_package_task_ids([target_pkg], running_only=True)
+    if target_pkg in tasks:
+        rc, _, _ = su(
+            "am start --activity-reorder-to-front -n com.termux/com.termux.app.TermuxActivity >/dev/null 2>&1",
+            8,
+        )
+        return rc == 0
     return False
 
 
@@ -408,12 +458,18 @@ def stop_package(pkg, use_focus=True):
 
 
 def remove_package_tasks(pkg):
-    """Remove Android task card(s) belonging to pkg (used when retiring deleted accounts)."""
-    tasks = get_package_task_ids([pkg])
-    tid = tasks.get(pkg)
-    if tid:
-        rc, _, _ = su(f"am stack remove {tid}", 8)
-        return rc == 0
+    """Remove Android task stack belonging to pkg (used when retiring deleted accounts)."""
+    rc, out, _ = su("am stack list", 10)
+    if rc != 0 or not out:
+        return False
+    parsed = _parse_stack_and_task_ids(out, [pkg])
+    info = parsed.get(pkg)
+    if not info:
+        return False
+    sid = info.get("stack_id")
+    if sid is not None and sid > 0:
+        rc2, _, _ = su(f"am stack remove {sid}", 8)
+        return rc2 == 0
     return False
 
 

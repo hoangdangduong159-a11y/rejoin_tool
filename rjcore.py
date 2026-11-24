@@ -380,9 +380,9 @@ def load_config():
     cfg.setdefault("stagger_launch_seconds", 8)
     cfg.setdefault("open_delay_seconds", 2)
     cfg.setdefault("sleep_after_kill_seconds", 2)
-    cfg.setdefault("sort_tabs", False)
+    cfg.setdefault("sort_tabs", True)
     cfg.setdefault("tiny_sort_tabs", False)
-    cfg.setdefault("sort_tabs_interval_seconds", 20)
+    cfg.setdefault("sort_tabs_interval_seconds", 15)
     cfg.setdefault("kill_all_on_crash", False)
     cfg.setdefault("change_acc_cus", True)
     cfg.setdefault("change_acc_bf", False)
@@ -400,6 +400,10 @@ def load_config():
     cfg.setdefault("server_hop_on_disconnect", False)
     cfg.setdefault("error_264_action", "cooldown")
     cfg.setdefault("instances", [])
+    if os.path.exists(CONFIG) and not cfg.get("_auto_resize_v5"):
+        cfg["sort_tabs"] = True
+        cfg["_auto_resize_v5"] = True
+        save_config(cfg)
     return cfg
 
 
@@ -429,7 +433,7 @@ DEFAULT_PROFILE = {
     "server_hop": False,
     "max_ram_mb": 0,
     "fps_cap": 0,
-    "window_mode": "default",
+    "window_mode": "freeform",
     "rotate_on": ["status:done"],
     "rules": [],
     "when_no_cookies": "wait",
@@ -556,6 +560,110 @@ def detect_packages(prefix=""):
             elif _ROBLOX_PKG_RE.match(p):
                 pk.append(p)
     return pk
+
+
+def get_installed_third_party_packages():
+    """Return set of installed 3rd-party Android package names, or None if pm check is unavailable."""
+    rc, out, _ = su("pm list packages -3", 15)
+    if rc != 0 or not out:
+        return None
+    installed = set()
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("package:"):
+            p = line[len("package:"):].strip()
+            if p:
+                installed.add(p)
+    return installed if installed else None
+
+
+def sync_installed_instances(cfg=None, store=None, auto_add=True, prune_uninstalled=True, persist=True):
+    """Synchronize config['instances'] with actually installed Android Roblox/clone packages."""
+    if os.environ.get("RJ_SKIP_PKG_SYNC") == "1" or not has_root():
+        return {"added": [], "removed": [], "changed": False}
+
+    installed = get_installed_third_party_packages()
+    if installed is None:
+        return {"added": [], "removed": [], "changed": False}
+
+    cfg_obj = cfg if cfg is not None else load_config()
+    store_obj = store if store is not None else Store()
+    instances = list(cfg_obj.get("instances") or [])
+    kept = []
+    removed = []
+    removed_names = []
+
+    if prune_uninstalled:
+        for inst in instances:
+            pkg = (inst.get("package") or "").strip()
+            if not pkg:
+                kept.append(inst)
+                continue
+            if pkg in installed:
+                kept.append(inst)
+                continue
+            rc_p, out_p, _ = su(f"pm path {shlex.quote(pkg)}", 8)
+            if rc_p == 0 and "package:" in out_p:
+                installed.add(pkg)
+                kept.append(inst)
+            else:
+                removed.append(pkg)
+                if inst.get("name"):
+                    removed_names.append(inst["name"])
+    else:
+        kept = instances
+
+    if removed_names:
+        store_obj.ensure_files()
+        kept_names = {i.get("name") for i in kept if i.get("name")}
+        all_assigned = store_obj.all_assigned()
+        in_use_cookies = {
+            v.get("cookie")
+            for k, v in all_assigned.items()
+            if k in kept_names and isinstance(v, dict) and v.get("cookie")
+        }
+        existing_queue = set(store_obj.queue())
+        for rname in removed_names:
+            assigned = all_assigned.get(rname)
+            if isinstance(assigned, dict):
+                ck = assigned.get("cookie")
+                if ck and ck not in in_use_cookies and ck not in existing_queue:
+                    store_obj.return_tail(ck)
+                    existing_queue.add(ck)
+            store_obj.set_assign(rname, None)
+
+    added = []
+    if auto_add:
+        existing_pkgs = {i.get("package") for i in kept if i.get("package")}
+        used_names = {i.get("name") for i in kept if i.get("name")}
+        detected = detect_packages(prefix=cfg_obj.get("package_prefix", ""))
+        if detected:
+            from sysutils import scan_executor_dirs
+            for p in detected:
+                if p not in existing_pkgs:
+                    idx = len(kept) + 1
+                    name = suggest_instance_name(p, idx, used_names=used_names)
+                    used_names.add(name)
+                    existing_pkgs.add(p)
+                    execs = scan_executor_dirs(pkg=p)
+                    kept.append({
+                        "name": name,
+                        "package": p,
+                        "profile": "default",
+                        "target": "",
+                        "workspace": execs[0]["workspace"] if execs else DEFAULT_WORKSPACE,
+                        "autoexec": execs[0]["autoexec"] if execs else DEFAULT_AUTOEXEC,
+                        "use_cookie_queue": True,
+                        "enabled": True,
+                    })
+                    added.append(p)
+
+    changed = bool(added or removed)
+    if changed:
+        cfg_obj["instances"] = kept
+        if persist:
+            save_config(cfg_obj)
+    return {"added": added, "removed": removed, "changed": changed}
 
 
 def read_clone_metadata(pkg):

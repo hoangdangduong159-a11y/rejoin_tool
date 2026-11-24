@@ -1013,6 +1013,114 @@ def test_cookie_prune_parallel():
         assert st.switched_counts()["captcha"] == 1
 
 
+def test_auto_resize_enabled_by_default():
+    orig_cfg = rjcore.CONFIG
+    with tempfile.TemporaryDirectory(dir=TMP_BASE) as td:
+        rjcore.CONFIG = os.path.join(td, "config.json")
+        try:
+            fresh = rjcore.load_config()
+            assert fresh["sort_tabs"] is True
+            assert fresh["sort_tabs_interval_seconds"] == 15
+
+            # Legacy config with sort_tabs=False migrates once to True
+            with open(rjcore.CONFIG, "w") as f:
+                json.dump({"sort_tabs": False, "instances": []}, f)
+            migrated = rjcore.load_config()
+            assert migrated["sort_tabs"] is True
+            assert migrated.get("_auto_resize_v5") is True
+        finally:
+            rjcore.CONFIG = orig_cfg
+
+    assert rjcore.DEFAULT_PROFILE["window_mode"] == "freeform"
+    rects = sysutils.calculate_grid_positions(2, 720, 1280, tiny=False, top_inset=48)
+    assert len(rects) == 2
+    assert rects[0][0] == 0 and rects[0][2] == 720
+    assert rects[1][0] == 0 and rects[1][2] == 720
+    assert rects[0][3] <= rects[1][1]
+
+
+def test_sync_prunes_uninstalled_packages_and_preserves_cookie():
+    with tempfile.TemporaryDirectory(dir=TMP_BASE) as td:
+        st = rjcore.Store(base_dir=td)
+        st.ensure_files()
+        ck_keep = "_|WARNING:-DO-NOT-SHARE-THIS.|_KEEP_" + ("K" * 160)
+        ck_lost = "_|WARNING:-DO-NOT-SHARE-THIS.|_LOST_" + ("L" * 160)
+        st.set_assign("clone1", {"cookie": ck_keep, "user_id": 1, "username": "keep_user", "started_at": 1.0})
+        st.set_assign("clone1_2", {"cookie": ck_lost, "user_id": 2, "username": "lost_user", "started_at": 1.0})
+
+        cfg = {
+            "package_prefix": "",
+            "instances": [
+                {"name": "clone1", "package": "vip.orsshjbd", "profile": "default", "target": "", "enabled": True},
+                {"name": "clone1_2", "package": "vip.ytcjk", "profile": "default", "target": "", "enabled": True},
+            ],
+        }
+        orig_get = rjcore.get_installed_third_party_packages
+        orig_det = rjcore.detect_packages
+        orig_root = rjcore.has_root
+        orig_su = rjcore.su
+        orig_skip = os.environ.pop("RJ_SKIP_PKG_SYNC", None)
+        try:
+            rjcore.get_installed_third_party_packages = lambda: {"vip.orsshjbd"}
+            rjcore.detect_packages = lambda prefix="": ["vip.orsshjbd"]
+            rjcore.has_root = lambda: True
+            rjcore.su = lambda cmd, timeout=30, clean_env=True: (1, "", "")
+            res = rjcore.sync_installed_instances(cfg, st, auto_add=True, prune_uninstalled=True, persist=False)
+        finally:
+            rjcore.get_installed_third_party_packages = orig_get
+            rjcore.detect_packages = orig_det
+            rjcore.has_root = orig_root
+            rjcore.su = orig_su
+            if orig_skip is not None:
+                os.environ["RJ_SKIP_PKG_SYNC"] = orig_skip
+
+        assert res["removed"] == ["vip.ytcjk"]
+        assert [i["package"] for i in cfg["instances"]] == ["vip.orsshjbd"]
+        assert st.get_assign("clone1_2") is None
+        assert ck_lost in st.queue()
+
+
+def test_running_only_task_detection():
+    fake_stack = "\n".join([
+        "Stack id=42 bounds=[0,0][720,1280] displayId=0 userId=0",
+        "  taskId=50: vip.orsshjbd/com.roblox.client.ActivityProtocolLaunch bounds=[0,0][720,640] visible=true",
+        "Stack id=7 bounds=[0,0][720,1280] displayId=0 userId=0",
+        "  taskId=51: vip.ytcjk/com.roblox.client.startup.ActivitySplash bounds=[0,0][720,1280] visible=false",
+    ])
+    orig_batch = sysutils.get_batch_pkg_usage
+    orig_su = sysutils.su
+    try:
+        sysutils.get_batch_pkg_usage = lambda pkgs: {
+            "vip.orsshjbd": {"pid": 1234, "mem_mb": 200.0},
+            "vip.ytcjk": {"pid": None, "mem_mb": None},
+        }
+        sysutils.su = lambda cmd, timeout=30: (0, fake_stack, "")
+        found = sysutils.get_package_task_ids(["vip.orsshjbd", "vip.ytcjk"], running_only=True)
+        assert found == {"vip.orsshjbd": 50}
+    finally:
+        sysutils.get_batch_pkg_usage = orig_batch
+        sysutils.su = orig_su
+
+
+def test_vietnamese_friendly_ui_no_daemon_jargon():
+    from io import StringIO
+    from rich.console import Console
+    buf = StringIO()
+    con = Console(file=buf, force_terminal=False, width=120)
+    layout = main._build_dashboard_layout(
+        [{"name": "clone1", "package": "vip.orsshjbd", "profile_name": "default", "username": "u1", "status": "RUNNING", "ram_mb": 120, "hb_age": 2, "rejoin_count": 0, "rotate_count": 0, "stats": {}, "last_event": "ok"}],
+        {"queue": 1, "done": 0, "dead": 0},
+        {"cpu_pct": 10, "ram_used_mb": 500, "ram_total_mb": 2000, "ram_pct": 25, "tool_ram_mb": 20, "disk_free_gb": 10, "load_1m": 0.5},
+        ["12:00:00 [clone1] ok"],
+        title_suffix=" [Đang treo ngầm]",
+    )
+    con.print(layout)
+    rendered = buf.getvalue()
+    assert "Daemon" not in rendered
+    assert "Đang chơi" in rendered
+    assert "Bảng Theo Dõi Auto Rejoin Roblox" in rendered
+
+
 if __name__ == "__main__":
     for fn in (
         test_quick_setup_commands,
@@ -1041,6 +1149,10 @@ if __name__ == "__main__":
         test_hybrid_mode_log_disconnect_and_ipc_rejoin,
         test_appcloner_metadata_and_vip_pkg_detection,
         test_cookie_prune_parallel,
+        test_auto_resize_enabled_by_default,
+        test_sync_prunes_uninstalled_packages_and_preserves_cookie,
+        test_running_only_task_detection,
+        test_vietnamese_friendly_ui_no_daemon_jargon,
     ):
         fn()
         print(f"[PASS] {fn.__name__}")
