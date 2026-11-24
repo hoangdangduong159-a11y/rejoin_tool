@@ -1,0 +1,23 @@
+{
+  "place_id": 2753915549,
+  "private_link": "",
+  "job_id": "",
+  "rejoin_after_minutes": 30,
+  "heartbeat_timeout": 45,
+  "launch_grace": 90,
+  "poll_interval": 3,
+  "max_rejoins_before_rotate": 5,
+  "check_presence": false,
+  "rotate_on": [
+    "status:done",
+    "stat:level>=100",
+    "elapsed_account:120m"
+  ],
+  "rules": [
+    "kicked -> rejoin",
+    "stat:currency>=1000000 -> notify"
+  ],
+  "when_no_cookies": "stop",
+  "lua": "example_custom.lua",
+  "launch_extra": ""
+}

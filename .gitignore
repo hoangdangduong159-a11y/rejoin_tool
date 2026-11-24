@@ -1,0 +1,15 @@
+cookies.txt
+cookies.txt.lock
+done.txt
+dead.txt
+extracted_cookies.txt
+*.cookies
+state.json
+config.json
+passwords.db*
+switched/
+.tmp/
+logs/
+__pycache__/
+*.pyc
+demo_auto_rejoin.py

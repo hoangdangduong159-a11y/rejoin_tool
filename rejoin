@@ -1,0 +1,31 @@
+#!/data/data/com.termux/files/usr/bin/env bash
+# Launcher của Rejoin Tool (tương đương caylapbu/main của QH Rejoin).
+# Dùng được cả trong Termux thường lẫn từ root:  su -c "... && /data/data/com.termux/files/home/rejoin_tool/rejoin"
+TERMUX_PREFIX="/data/data/com.termux/files/usr"
+TERMUX_HOME="/data/data/com.termux/files/home"
+RJ_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+export PATH="$TERMUX_PREFIX/bin:$PATH"
+export TERM="${TERM:-xterm-256color}"
+export TMPDIR="${TMPDIR:-$TERMUX_PREFIX/tmp}"
+export LD_LIBRARY_PATH="$TERMUX_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+if [ "$(id -u)" = "0" ]; then
+    # Chạy bằng root: giữ HOME của Termux, không tạo __pycache__ thuộc root,
+    # và trả quyền sở hữu file (config/cookies/logs) về user Termux sau khi thoát.
+    export HOME="$TERMUX_HOME"
+    export PYTHONDONTWRITEBYTECODE=1
+    OWNER="$(stat -c '%u:%g' "$RJ_DIR" 2>/dev/null)"
+    umask 022
+    trap ':' INT TERM
+    "$TERMUX_PREFIX/bin/python" "$RJ_DIR/main.py" "$@"
+    rc=$?
+    if [ -n "$OWNER" ] && [ "$OWNER" != "0:0" ]; then
+        chown -R "$OWNER" "$RJ_DIR" 2>/dev/null
+        [ -d "$TERMUX_HOME/.termux/boot" ] && chown -R "$OWNER" "$TERMUX_HOME/.termux/boot" 2>/dev/null
+        [ -S "$TERMUX_HOME/.rejoin_ipc.sock" ] && chown "$OWNER" "$TERMUX_HOME/.rejoin_ipc.sock" 2>/dev/null
+    fi
+    exit $rc
+fi
+
+exec "$TERMUX_PREFIX/bin/python" "$RJ_DIR/main.py" "$@"

@@ -1,0 +1,32 @@
+{
+  "place_id": 2753915549,
+  "private_link": "",
+  "job_id": "",
+  "rejoin_after_minutes": 30,
+  "rotate_after_minutes": 0,
+  "heartbeat_timeout": 45,
+  "launch_grace": 90,
+  "poll_interval": 3,
+  "max_rejoins_before_rotate": 5,
+  "check_method": "executor",
+  "check_presence": false,
+  "presence_recheck_strikes": 3,
+  "presence_poll_seconds": 30,
+  "open_splash_first": false,
+  "on_challenge": "pause",
+  "retire_on_deleted": false,
+  "clear_cache_on_rejoin": false,
+  "max_ram_mb": 0,
+  "fps_cap": 15,
+  "window_mode": "default",
+  "rotate_on": [
+    "status:done",
+    "stat:level>=2600"
+  ],
+  "rules": [
+    "kicked -> rejoin"
+  ],
+  "when_no_cookies": "stop",
+  "lua": "blox_fruits_auto.lua",
+  "launch_extra": ""
+}

@@ -1,0 +1,18 @@
+{
+  "place_id": 0,
+  "private_link": "",
+  "job_id": "",
+  "rejoin_after_minutes": 30,
+  "heartbeat_timeout": 45,
+  "launch_grace": 90,
+  "poll_interval": 3,
+  "max_rejoins_before_rotate": 0,
+  "check_presence": false,
+  "rotate_on": [
+    "status:done"
+  ],
+  "rules": [],
+  "when_no_cookies": "stop",
+  "lua": "",
+  "launch_extra": ""
+}
