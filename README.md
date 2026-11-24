@@ -81,6 +81,7 @@ rejoin boot disable
 
 ## 4. ⚡ Quick Setup (kiểu QH Rejoin)
 
+> 📖 Hướng dẫn đầy đủ: [HUONG_DAN_SETUP_NHANH.md](HUONG_DAN_SETUP_NHANH.md)
 > Gõ `rejoin commands` để in toàn bộ các lệnh bên dưới với đúng đường dẫn trên máy bạn.
 
 **Setup** (cài mới / cập nhật — cài Termux packages, xin quyền bộ nhớ, clone repo, cài `requests` + `rich`, tạo lệnh `rejoin`, quét clone + deploy Lua):
