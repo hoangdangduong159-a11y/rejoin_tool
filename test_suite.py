@@ -1020,23 +1020,132 @@ def test_auto_resize_enabled_by_default():
         try:
             fresh = rjcore.load_config()
             assert fresh["sort_tabs"] is True
+            assert fresh["sort_tabs_mode"] == "left_to_right"
             assert fresh["sort_tabs_interval_seconds"] == 15
 
-            # Legacy config with sort_tabs=False migrates once to True
+            # Legacy config with sort_tabs=False migrates once to True + left_to_right
             with open(rjcore.CONFIG, "w") as f:
                 json.dump({"sort_tabs": False, "instances": []}, f)
             migrated = rjcore.load_config()
             assert migrated["sort_tabs"] is True
-            assert migrated.get("_auto_resize_v5") is True
+            assert migrated["sort_tabs_mode"] == "left_to_right"
+            assert migrated.get("_auto_resize_v6") is True
         finally:
             rjcore.CONFIG = orig_cfg
 
     assert rjcore.DEFAULT_PROFILE["window_mode"] == "freeform"
-    rects = sysutils.calculate_grid_positions(2, 720, 1280, tiny=False, top_inset=48)
-    assert len(rects) == 2
-    assert rects[0][0] == 0 and rects[0][2] == 720
-    assert rects[1][0] == 0 and rects[1][2] == 720
-    assert rects[0][3] <= rects[1][1]
+
+    r1 = sysutils.calculate_grid_positions(1, 720, 1184, tiny=False, top_inset=48, mode="left_to_right")
+    assert len(r1) == 1 and r1[0][3] < 1000
+
+    r2 = sysutils.calculate_grid_positions(2, 720, 1184, tiny=False, top_inset=48, mode="left_to_right")
+    assert len(r2) == 2
+    assert r2[0][2] <= r2[1][0] and r2[0][1] == r2[1][1]
+
+    r3 = sysutils.calculate_grid_positions(3, 720, 1184, tiny=False, top_inset=48, mode="left_to_right")
+    assert len(r3) == 3
+    assert r3[0][2] <= r3[1][0] and r3[1][2] <= r3[2][0]
+
+    r4 = sysutils.calculate_grid_positions(4, 720, 1184, tiny=False, top_inset=48, mode="left_to_right")
+    assert len(r4) == 4
+    assert r4[0][2] <= r4[1][0] and r4[2][2] <= r4[3][0] and r4[0][3] <= r4[2][1]
+
+    r6 = sysutils.calculate_grid_positions(6, 720, 1184, tiny=False, top_inset=48, mode="horizontal_strip", min_size=216)
+    assert len(r6) == 6
+    for i in range(5):
+        assert r6[i][0] < r6[i + 1][0]
+    for l, t, r, b in r6:
+        assert (r - l) >= 216 and (b - t) >= 216
+
+
+def test_false_positive_jni_btid_and_loading_grace():
+    noisy_log = "\n".join([
+        "2026-11-24T18:54:26.691Z,1.691668,7b9f8d50,6,Info [FLog::JNIAppBridge] ... StartupController finished starting: stage = 2, BTID = 1749283746, upgradeStatus = 0.",
+        "2026-11-24T18:54:27.100Z,2.100000,7b9f8d50,6,Info [FLog::HumanoidFloorProcess] Disconnecting from last floor",
+        "2026-11-24T18:54:27.200Z,2.200000,7b9f8d50,6,Error [FLog::IxpController] IXP (layer type: 1) - layer error code = 279 status-code = 500",
+        "2026-11-24T18:54:27.300Z,2.300000,7b9f8d50,6,Error [FLog::AssetsUploadApiFlow] create assets failed with statusCode: 400 errorCode: 277",
+        "2026-11-24T18:54:27.400Z,2.400000,7b9f8d50,6,Info [FLog::Network] Disconnect from 128.116.1.1|50000",
+    ])
+    parsed = log_watch.parse_roblox_log_tail(noisy_log)
+    assert parsed["state"] != "disconnected", f"False-positive disconnect: {parsed}"
+    assert parsed["error_code"] is None, f"Unexpected error_code: {parsed}"
+
+    # Verify loading grace prevents premature heartbeat_timeout kill
+    with tempfile.TemporaryDirectory(dir=TMP_BASE) as td:
+        st = rjcore.Store(base_dir=td)
+        st.ensure_files()
+        c1 = "_|WARNING:-DO-NOT-SHARE-THIS.|_GRACE_" + ("G" * 160)
+        st.add_cookies(c1)
+        ws = os.path.join(td, "ws")
+        os.makedirs(os.path.join(ws, "rejoin"), exist_ok=True)
+        cfg = {
+            "webhook": "",
+            "stagger_launch_seconds": 0,
+            "instances": [{
+                "name": "grace1",
+                "package": "vip.orsshjbd",
+                "profile": "default",
+                "workspace": ws,
+                "autoexec": td,
+                "use_cookie_queue": True,
+                "enabled": True,
+            }],
+        }
+        prof_override = {
+            **rjcore.DEFAULT_PROFILE,
+            "name": "grace_prof",
+            "place_id": 8304191830,
+            "check_method": "hybrid",
+            "heartbeat_timeout": 0.3,
+            "launch_grace": 10.0,
+            "poll_interval": 0.2,
+            "rejoin_after_minutes": 0,
+        }
+        mgr = engine.Manager(cfg, st, rjcore.Logger(echo=False))
+        mgr.start(dry_run=True, profile_override=prof_override)
+        try:
+            time.sleep(0.35)
+            hb_file = os.path.join(ws, "rejoin", "hb_1000.json")
+            with open(hb_file, "w") as f:
+                json.dump({"time": time.time(), "placeId": 8304191830, "gameId": 12345, "userId": 1000, "username": "dry_run_user", "status": "loading", "stats": {}}, f)
+            time.sleep(1.0)
+            snap = mgr.snapshot()[0]
+            assert snap["rejoin_count"] == 0, f"Premature rejoin during launch_grace: {snap}"
+        finally:
+            mgr.stop(timeout=3)
+
+
+def test_binder_windowing_mode_resolver_and_web_layout_api():
+    tx = sysutils._get_set_windowing_mode_tx()
+    if os.path.isfile("/system/framework/framework.jar"):
+        assert tx is not None and isinstance(tx[1], int) and tx[1] > 0, f"Bad tx resolver: {tx}"
+
+    orig_cfg = rjcore.CONFIG
+    with tempfile.TemporaryDirectory(dir=TMP_BASE) as td:
+        rjcore.CONFIG = os.path.join(td, "config.json")
+        try:
+            rjcore.save_config({"sort_tabs": True, "sort_tabs_mode": "left_to_right", "instances": []})
+            st = rjcore.Store(base_dir=td)
+            st.ensure_files()
+            cc_path = os.path.join(td, "cc.json")
+            rjcore.save_change_config(rjcore.DEFAULT_CHANGE_CONFIG, path=cc_path)
+            srv = web_panel.WebPanelServer(host="127.0.0.1", port=0, token="tok_layout", store=st, change_config_path=cc_path)
+            url = srv.start()
+            try:
+                req = urllib.request.Request(
+                    url + "/api/action",
+                    data=json.dumps({"action": "set_tab_layout", "sort_tabs": True, "mode": "horizontal_strip"}).encode("utf-8"),
+                    headers={"Authorization": "Bearer tok_layout", "Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    d = json.loads(resp.read().decode("utf-8"))
+                    assert d["ok"] is True and d["mode"] == "horizontal_strip"
+                assert rjcore.load_config()["sort_tabs_mode"] == "horizontal_strip"
+            finally:
+                srv.stop()
+        finally:
+            rjcore.CONFIG = orig_cfg
 
 
 def test_sync_prunes_uninstalled_packages_and_preserves_cookie():
@@ -1150,6 +1259,8 @@ if __name__ == "__main__":
         test_appcloner_metadata_and_vip_pkg_detection,
         test_cookie_prune_parallel,
         test_auto_resize_enabled_by_default,
+        test_false_positive_jni_btid_and_loading_grace,
+        test_binder_windowing_mode_resolver_and_web_layout_api,
         test_sync_prunes_uninstalled_packages_and_preserves_cookie,
         test_running_only_task_detection,
         test_vietnamese_friendly_ui_no_daemon_jargon,

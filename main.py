@@ -154,6 +154,41 @@ STATUS_LABELS_VI = {
 }
 
 
+def _meter_bar(pct, width=10):
+    p = max(0.0, min(100.0, float(pct or 0.0)))
+    filled = int(round((p / 100.0) * width))
+    col = "red" if p >= 85 else ("yellow" if p >= 65 else "green")
+    return f"[{col}]{'█' * filled}[/{col}][dim]{'░' * (width - filled)}[/dim]"
+
+
+def _layout_mode_label(cfg):
+    if cfg.get("tiny_sort_tabs"):
+        return "[green]Ô thu nhỏ[/]"
+    if not cfg.get("sort_tabs", True):
+        return "[yellow]Đang tắt[/]"
+    mode = str(cfg.get("sort_tabs_mode") or "left_to_right")
+    labels = {
+        "left_to_right": "[green]Trái → Phải (Mặc định)[/]",
+        "horizontal_strip": "[green]Dải ngang 1 hàng[/]",
+        "grid": "[green]Chia lưới đều[/]",
+        "tiny": "[green]Ô thu nhỏ[/]",
+    }
+    return labels.get(mode, "[green]Trái → Phải (Mặc định)[/]")
+
+
+def _colorize_log_line(line):
+    low = line.lower()
+    if any(k in low for k in ("err", "disconnect", "stale", "fail", "dead")):
+        return f"[red]{line}[/red]"
+    if any(k in low for k in ("launching", "wait", "warn", "challenge")):
+        return f"[yellow]{line}[/yellow]"
+    if any(k in low for k in ("running", "rotated", "switched", "added", "adopted")):
+        return f"[green]{line}[/green]"
+    if any(k in low for k in ("[web]", "[sys]", "[hub]")):
+        return f"[cyan]{line}[/cyan]"
+    return f"[dim]{line}[/dim]"
+
+
 def _build_dashboard_layout(rows, counts, sys_st, log_lines, switched=None, title_suffix=""):
     sw_txt = ""
     if switched:
@@ -161,14 +196,17 @@ def _build_dashboard_layout(rows, counts, sys_st, log_lines, switched=None, titl
         if parts:
             sw_txt = "  |  Đã phân loại: " + " ".join(parts)
 
+    cpu_pct = sys_st.get("cpu_pct", 0)
+    ram_pct = sys_st.get("ram_pct", 0)
     table = Table(
         title=(
-            f"📊 Bảng Theo Dõi Auto Rejoin Roblox{title_suffix}  |  Kho Acc chờ: {counts['queue']}  Đã xong: {counts['done']}  Acc lỗi: {counts['dead']}{sw_txt}\n"
-            f"[dim]CPU: {sys_st.get('cpu_pct', 0):.0f}%  |  RAM: {sys_st['ram_used_mb']:.0f}/{sys_st['ram_total_mb']:.0f}MB ({sys_st['ram_pct']:.0f}%)  |  "
-            f"Tool: {sys_st.get('tool_ram_mb', 0):.0f}MB  |  Bộ nhớ trống: {sys_st['disk_free_gb']}GB  |  Tải máy: {sys_st['load_1m']}[/dim]"
+            f"📊 Bảng Theo Dõi Auto Rejoin Roblox{title_suffix}  |  Kho Acc chờ: [cyan]{counts['queue']}[/]  Đã xong: [green]{counts['done']}[/]  Acc lỗi: [red]{counts['dead']}[/]{sw_txt}\n"
+            f"[dim]CPU: {cpu_pct:.0f}%[/dim] {_meter_bar(cpu_pct, 8)}  [dim]|  RAM: {sys_st['ram_used_mb']:.0f}/{sys_st['ram_total_mb']:.0f}MB ({ram_pct:.0f}%)[/dim] {_meter_bar(ram_pct, 8)}  [dim]|  "
+            f"Tool: {sys_st.get('tool_ram_mb', 0):.0f}MB  |  Trống: {sys_st['disk_free_gb']}GB  |  Tải: {sys_st['load_1m']}[/dim]"
         ),
         box=box.ROUNDED,
-        border_style="bright_blue",
+        border_style="bright_cyan",
+        header_style="bold cyan",
     )
     table.add_column("Tab", style="bold cyan")
     table.add_column("Gói App", style="dim")
@@ -218,10 +256,11 @@ def _build_dashboard_layout(rows, counts, sys_st, log_lines, switched=None, titl
             info[:40],
         )
 
+    colored_logs = [_colorize_log_line(l) for l in (log_lines or [])]
     log_panel = Panel(
-        "\n".join(log_lines) or "[dim]Đang chờ sự kiện...[/dim]",
+        "\n".join(colored_logs) or "[dim]Đang chờ sự kiện...[/dim]",
         title="Nhật ký hoạt động (Bấm Ctrl+C để thoát bảng)",
-        border_style="dim",
+        border_style="cyan",
     )
 
     layout = Layout()
@@ -301,7 +340,7 @@ def cmd_status(_args):
     hb_ok = os.path.exists(os.path.join(DEFAULT_AUTOEXEC, HEARTBEAT_FILENAME))
     bg_ping = ipc_request("ping", timeout=1.0)
     bg_txt = f"[green]ĐANG CHẠY (PID {bg_ping['result'].get('pid')})[/]" if bg_ping.get("ok") else "[dim]ĐANG TẮT[/]"
-    resize_txt = "[green]Thu nhỏ[/]" if cfg.get("tiny_sort_tabs") else ("[green]Tự chia ô[/]" if cfg.get("sort_tabs", True) else "[yellow]Đang tắt[/]")
+    resize_txt = _layout_mode_label(cfg)
     sw_non_zero = "  ".join(f"{k}={v}" for k, v in sw.items() if v > 0) or "-"
 
     console.print(
@@ -698,10 +737,18 @@ def cmd_tabs(args):
     pkgs = [args.package] if getattr(args, "package", None) else (
         [i["package"] for i in cfg["instances"] if i.get("enabled", True) and i.get("package")] or detect_packages()
     )
-    if args.action in ("sort", "tiny"):
-        tiny = args.action == "tiny"
-        n = sort_roblox_tabs(pkgs, tiny=tiny)
-        console.print(f"[green]Resized {n} active tab(s) ({'tiny' if tiny else 'grid'} mode).[/green]")
+    if args.action in ("sort", "left-to-right", "strip", "grid", "tiny"):
+        mode_map = {
+            "sort": "tiny" if cfg.get("tiny_sort_tabs") else (cfg.get("sort_tabs_mode") or "left_to_right"),
+            "left-to-right": "left_to_right",
+            "strip": "horizontal_strip",
+            "grid": "grid",
+            "tiny": "tiny",
+        }
+        mode = mode_map[args.action]
+        tiny = mode == "tiny"
+        n = sort_roblox_tabs(pkgs, tiny=tiny, mode=mode)
+        console.print(f"[green]Đã sắp xếp {n} cửa sổ Roblox ({mode}).[/green]")
         return 0
     if args.action == "open-all":
         stagger = float(cfg.get("stagger_launch_seconds") or 4)
@@ -1396,8 +1443,8 @@ def cmd_config(_args=None):
         table.add_column("Trạng thái hiện tại")
 
         table.add_row("", "[bold blue]── TỰ XẾP CỬA SỔ & GIẢM LAG ──[/bold blue]", "")
-        table.add_row("1", "Tự động chia ô cửa sổ Roblox (Auto Resize Tab)", _yn(cfg.get("sort_tabs", True)))
-        table.add_row("2", "Xếp cửa sổ dạng ô thu nhỏ (Tiny Tabs)", _yn(cfg.get("tiny_sort_tabs")))
+        table.add_row("1", "Tự động sắp xếp cửa sổ Roblox (Auto Resize Tab)", _yn(cfg.get("sort_tabs", True)))
+        table.add_row("2", "Kiểu sắp xếp cửa sổ (Trái→Phải / Dải ngang / Lưới / Thu nhỏ)", _layout_mode_label(cfg))
         table.add_row("3", "Chu kỳ tự xếp lại cửa sổ (giây)", f"[yellow]{cfg.get('sort_tabs_interval_seconds', 15)}[/yellow] giây")
         table.add_row("4", "Đóng toàn bộ tab nếu 1 tab bị văng", _yn(cfg.get("kill_all_on_crash")))
         table.add_row("5", "Chuyển về Termux trước khi tắt tab Roblox", _yn(cfg.get("focus_before_kill", True)))
@@ -1454,7 +1501,14 @@ def cmd_config(_args=None):
         if ch == "1":
             cfg["sort_tabs"] = not cfg.get("sort_tabs", True)
         elif ch == "2":
-            cfg["tiny_sort_tabs"] = not cfg.get("tiny_sort_tabs", False)
+            m = Prompt.ask(
+                "Chọn kiểu xếp (left_to_right=Trái→Phải, horizontal_strip=Dải ngang, grid=Lưới, tiny=Thu nhỏ)",
+                choices=["left_to_right", "horizontal_strip", "grid", "tiny"],
+                default=cfg.get("sort_tabs_mode") or "left_to_right",
+            )
+            cfg["sort_tabs_mode"] = m
+            cfg["tiny_sort_tabs"] = (m == "tiny")
+            cfg["sort_tabs"] = True
         elif ch == "3":
             cfg["sort_tabs_interval_seconds"] = max(10, IntPrompt.ask("Chu kỳ tự xếp cửa sổ (giây, tối thiểu 10)", default=int(cfg.get("sort_tabs_interval_seconds") or 15)))
         elif ch == "4":
@@ -1841,26 +1895,30 @@ def _menu_optimizer():
             title="🪟 Xếp Cửa Sổ, Giảm Lag & Dọn Máy",
             border_style="green",
         ))
-        console.print("[1] Chia ô cửa sổ Roblox (Lưới)  [2] Xếp cửa sổ thu nhỏ (Tiny)  [3] Mở tất cả Tab Roblox  [4] Tắt toàn bộ Tab (Kill Mode)  [5] Dọn bộ nhớ đệm (Cache)  [6] Giảm đồ họa + Khoá FPS  [7] Tối ưu máy Cloud (Tắt hiệu ứng + Chống ngủ)  [8] Đăng xuất toàn bộ Tab  [0] Quay lại")
-        c = Prompt.ask("Chọn", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8"], default="0")
+        console.print("[1] Xếp Trái → Phải (Mặc định)  [2] Dải ngang 1 hàng  [3] Chia lưới đều  [4] Ô thu nhỏ (Tiny)  [5] Mở tất cả Tab  [6] Tắt toàn bộ Tab  [7] Dọn Cache  [8] Giảm đồ họa + FPS  [9] Tối ưu Cloud  [10] Đăng xuất tất cả  [0] Quay lại")
+        c = Prompt.ask("Chọn", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"], default="0")
         if c == "0":
             return
         if c == "1":
-            cmd_tabs(argparse.Namespace(action="sort", package=None))
+            cmd_tabs(argparse.Namespace(action="left-to-right", package=None))
         elif c == "2":
-            cmd_tabs(argparse.Namespace(action="tiny", package=None))
+            cmd_tabs(argparse.Namespace(action="strip", package=None))
         elif c == "3":
-            cmd_tabs(argparse.Namespace(action="open-all", package=None))
+            cmd_tabs(argparse.Namespace(action="grid", package=None))
         elif c == "4":
-            cmd_optimize(argparse.Namespace(package=None, kill_all=True, clear_cache=False, fps=None, cloud_tune=False))
+            cmd_tabs(argparse.Namespace(action="tiny", package=None))
         elif c == "5":
-            cmd_optimize(argparse.Namespace(package=None, kill_all=False, clear_cache=True, fps=None, cloud_tune=False))
+            cmd_tabs(argparse.Namespace(action="open-all", package=None))
         elif c == "6":
+            cmd_optimize(argparse.Namespace(package=None, kill_all=True, clear_cache=False, fps=None, cloud_tune=False))
+        elif c == "7":
+            cmd_optimize(argparse.Namespace(package=None, kill_all=False, clear_cache=True, fps=None, cloud_tune=False))
+        elif c == "8":
             fps = IntPrompt.ask("Giới hạn FPS mục tiêu", default=15)
             cmd_optimize(argparse.Namespace(package=None, kill_all=False, clear_cache=False, fps=fps, cloud_tune=False))
-        elif c == "7":
+        elif c == "9":
             cmd_optimize(argparse.Namespace(package=None, kill_all=False, clear_cache=False, fps=None, cloud_tune=True))
-        elif c == "8":
+        elif c == "10":
             if Confirm.ask("Đăng xuất và xoá cookie khỏi TẤT CẢ các Tab Roblox?", default=False):
                 cmd_tabs(argparse.Namespace(action="logout", package=None, call_api=False))
         Prompt.ask("Bấm Enter để tiếp tục", default="")
@@ -1902,25 +1960,21 @@ def interactive_menu():
         enabled = sum(1 for i in cfg["instances"] if i.get("enabled", True))
         ping = ipc_request("ping", timeout=0.6)
         bg_badge = "[green]ĐANG CHẠY[/]" if ping.get("ok") else "[dim]ĐANG TẮT[/]"
-        if cfg.get("tiny_sort_tabs"):
-            resize_badge = "[green]Thu nhỏ[/]"
-        elif cfg.get("sort_tabs", True):
-            resize_badge = "[green]Đang bật[/]"
-        else:
-            resize_badge = "[yellow]Đang tắt[/]"
+        resize_badge = _layout_mode_label(cfg)
         web_badge = f"[green]Bật (:{cfg.get('web_port', 8787)})[/]" if cfg.get("web_enabled") else "[dim]Tắt[/]"
         console.clear()
         console.print(Panel(
-            f"[bold cyan]🛠 BẢNG ĐIỀU KHIỂN AUTO REJOIN ROBLOX[/bold cyan]\n"
+            f"[bold bright_cyan]⚡ BẢNG ĐIỀU KHIỂN AUTO REJOIN ROBLOX v4.0[/bold bright_cyan]\n"
             f"Quyền Root: {'[green]Đã cấp[/]' if has_root() else '[red]Chưa có[/]'}  •  "
             f"Treo ngầm: {bg_badge}  •  "
-            f"Tự xếp cửa sổ: {resize_badge}  •  "
-            f"Bảng Web: {web_badge}\n"
+            f"Xếp cửa sổ: {resize_badge}  •  "
+            f"Web UI: {web_badge}\n"
             f"Tab Roblox: [cyan]{enabled}/{len(cfg['instances'])} đang bật[/]  •  "
-            f"Kho Acc chờ: [yellow]{cnt['queue']}[/]  •  Đã cày xong: [green]{cnt['done']}[/]  •  Acc lỗi/die: [red]{cnt['dead']}[/]\n"
-            f"CPU: [cyan]{st['cpu_pct']:.0f}%[/]  •  RAM: [cyan]{st['ram_used_mb']:.0f}/{st['ram_total_mb']:.0f}MB ({st['ram_pct']:.0f}%)[/]  •  "
-            f"Bộ nhớ trống: [cyan]{st['disk_free_gb']}GB[/]",
-            border_style="bright_blue",
+            f"Kho Acc chờ: [yellow]{cnt['queue']}[/]  •  Đã xong: [green]{cnt['done']}[/]  •  Acc lỗi: [red]{cnt['dead']}[/]\n"
+            f"CPU: [cyan]{st['cpu_pct']:.0f}%[/] {_meter_bar(st['cpu_pct'], 8)}  •  "
+            f"RAM: [cyan]{st['ram_used_mb']:.0f}/{st['ram_total_mb']:.0f}MB ({st['ram_pct']:.0f}%)[/] {_meter_bar(st['ram_pct'], 8)}  •  "
+            f"Trống: [cyan]{st['disk_free_gb']}GB[/]",
+            border_style="bright_cyan",
         ))
         menu = Table(box=box.ROUNDED, show_header=False)
         menu.add_column(style="bold yellow", justify="center", width=4)
@@ -2083,7 +2137,7 @@ def build_parser():
     po.add_argument("--cloud-tune", action="store_true", help="Disable OS animations + whitelist Doze + trim background")
 
     pt = sub.add_parser("tabs", help="Arrange/open/logout Roblox window tabs")
-    pt.add_argument("action", choices=["sort", "tiny", "open-all", "logout"])
+    pt.add_argument("action", choices=["sort", "left-to-right", "strip", "grid", "tiny", "open-all", "logout"])
     pt.add_argument("--package", "-k", help="Target package")
     pt.add_argument("--call-api", action="store_true", help="Also invalidate Roblox session via /v2/logout on logout")
 

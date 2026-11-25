@@ -4,9 +4,12 @@ import math
 import os
 import re
 import shlex
+import struct
 import subprocess
 import threading
 import time
+import zipfile
+import zlib
 
 import requests
 from rich.progress import BarColumn, DownloadColumn, Progress, SpinnerColumn, TextColumn, TimeRemainingColumn
@@ -286,6 +289,102 @@ def optimize_cloud_device(packages=None, disable_animations=True, whitelist_doze
 
 # ───────────────────────── window grid & tab sorter ─────────────────────────
 _FREEFORM_READY = False
+_SET_WIN_MODE_TX = None
+_SET_WIN_MODE_LOCK = threading.Lock()
+
+
+def _read_uleb128(buf, pos):
+    res = 0
+    shift = 0
+    while True:
+        b = buf[pos]
+        pos += 1
+        res |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return res, pos
+        shift += 7
+
+
+def _get_set_windowing_mode_tx(framework_jar="/system/framework/framework.jar"):
+    """Resolve Binder transaction code for IActivityTaskManager.setTaskWindowingMode(I,I,Z) from framework.jar."""
+    global _SET_WIN_MODE_TX
+    with _SET_WIN_MODE_LOCK:
+        if _SET_WIN_MODE_TX is not None:
+            return _SET_WIN_MODE_TX if _SET_WIN_MODE_TX else None
+        resolved = False
+        try:
+            if not os.path.isfile(framework_jar):
+                _SET_WIN_MODE_TX = False
+                return None
+            with zipfile.ZipFile(framework_jar, "r") as zf:
+                dex_names = sorted(n for n in zf.namelist() if n.endswith(".dex"))
+                targets = (
+                    ("Landroid/app/IActivityTaskManager;", "activity_task"),
+                    ("Landroid/app/IActivityManager;", "activity"),
+                )
+                for cls_target, svc_name in targets:
+                    if resolved:
+                        break
+                    for dname in dex_names:
+                        dex = zf.read(dname)
+                        if cls_target.encode("ascii") not in dex or b"setTaskWindowingMode" not in dex:
+                            continue
+                        s_off, t_off, p_off = struct.unpack_from("<III", dex, 60)
+                        t_off = struct.unpack_from("<I", dex, 68)[0]
+                        p_off = struct.unpack_from("<I", dex, 76)[0]
+                        m_off = struct.unpack_from("<I", dex, 92)[0]
+                        c_cnt, c_off = struct.unpack_from("<II", dex, 96)
+
+                        def _gstr(idx):
+                            doff = struct.unpack_from("<I", dex, s_off + idx * 4)[0]
+                            _, p = _read_uleb128(dex, doff)
+                            end = dex.find(b"\x00", p)
+                            return dex[p:end].decode("utf-8", "ignore")
+
+                        def _gtype(idx):
+                            return _gstr(struct.unpack_from("<I", dex, t_off + idx * 4)[0])
+
+                        for c in range(c_cnt):
+                            co = c_off + c * 32
+                            cn = _gtype(struct.unpack_from("<I", dex, co)[0])
+                            if cn != cls_target:
+                                continue
+                            data_off = struct.unpack_from("<I", dex, co + 24)[0]
+                            if not data_off:
+                                continue
+                            sf, p = _read_uleb128(dex, data_off)
+                            inf, p = _read_uleb128(dex, p)
+                            dm, p = _read_uleb128(dex, p)
+                            vm, p = _read_uleb128(dex, p)
+                            for _ in range(sf + inf):
+                                _, p = _read_uleb128(dex, p)
+                                _, p = _read_uleb128(dex, p)
+                            for _ in range(dm):
+                                _, p = _read_uleb128(dex, p)
+                                _, p = _read_uleb128(dex, p)
+                                _, p = _read_uleb128(dex, p)
+                            m_idx = 0
+                            for tx in range(1, vm + 1):
+                                d_idx, p = _read_uleb128(dex, p)
+                                _, p = _read_uleb128(dex, p)
+                                _, p = _read_uleb128(dex, p)
+                                m_idx += d_idx
+                                proto_idx = struct.unpack_from("<H", dex, m_off + m_idx * 8 + 2)[0]
+                                name_idx = struct.unpack_from("<I", dex, m_off + m_idx * 8 + 4)[0]
+                                if _gstr(name_idx) == "setTaskWindowingMode":
+                                    par_off = struct.unpack_from("<I", dex, p_off + proto_idx * 12 + 8)[0]
+                                    if par_off:
+                                        psz = struct.unpack_from("<I", dex, par_off)[0]
+                                        ptypes = [_gtype(struct.unpack_from("<H", dex, par_off + 4 + i * 2)[0]) for i in range(psz)]
+                                        if ptypes == ["I", "I", "Z"]:
+                                            resolved = (svc_name, tx)
+                                            break
+                            if resolved:
+                                break
+        except Exception:
+            resolved = False
+        _SET_WIN_MODE_TX = resolved
+        return resolved if resolved else None
 
 
 def ensure_freeform_support():
@@ -294,8 +393,11 @@ def ensure_freeform_support():
     if _FREEFORM_READY:
         return True
     rc, _, _ = su(
+        "settings put global development_settings_enabled 1; "
         "settings put global enable_freeform_support 1; "
-        "settings put global force_resizable_activities 1",
+        "settings put global force_resizable_activities 1; "
+        "settings put global enable_non_resizable_multi_window 1; "
+        "am suppress-resize-config-changes true >/dev/null 2>&1 || true",
         8,
     )
     if rc == 0:
@@ -304,21 +406,48 @@ def ensure_freeform_support():
     return False
 
 
-def get_screen_resolution():
-    """Return (width, height) from `wm size`, preferring Override size."""
-    rc, out, _ = su("wm size", 8)
+def get_display_metrics():
+    """Return dict with width, height, app_bottom, top_inset, and min_size from wm/dumpsys."""
+    w, h = 1080, 1920
+    app_bottom = None
+    min_size = 216
+    rc, out, _ = su("wm size; echo '---'; dumpsys window displays", 10)
     if rc == 0 and out:
         ovr = re.search(r"Override size:\s*(\d+)x(\d+)", out)
-        if ovr:
-            return int(ovr.group(1)), int(ovr.group(2))
         phy = re.search(r"Physical size:\s*(\d+)x(\d+)", out)
-        if phy:
-            return int(phy.group(1)), int(phy.group(2))
-    return 1080, 1920
+        if ovr:
+            w, h = int(ovr.group(1)), int(ovr.group(2))
+        elif phy:
+            w, h = int(phy.group(1)), int(phy.group(2))
+        m_app = re.search(r"mAppBounds=Rect\(\d+,\s*\d+\s*-\s*(\d+),\s*(\d+)\)", out)
+        if m_app:
+            app_bottom = int(m_app.group(2))
+        else:
+            m_info = re.search(r"app\s+(\d+)\s*x\s*(\d+)", out)
+            if m_info:
+                app_bottom = int(m_info.group(2))
+        m_min = re.search(r"mDefaultMinSize=(\d+)", out)
+        if m_min:
+            min_size = max(160, int(m_min.group(1)))
+    if not app_bottom or app_bottom > h or app_bottom < 320:
+        app_bottom = h
+    return {
+        "width": w,
+        "height": h,
+        "app_bottom": app_bottom,
+        "top_inset": 48,
+        "min_size": min_size,
+    }
+
+
+def get_screen_resolution():
+    """Return (width, height) from `wm size`, preferring Override size."""
+    m = get_display_metrics()
+    return m["width"], m["height"]
 
 
 def _parse_stack_and_task_ids(text, packages):
-    """Parse {package: {'task_id': int, 'stack_id': int | None}} from `am stack list` / dumpsys."""
+    """Parse {package: {'task_id': int, 'stack_id': int | None, 'windowing_mode': str, 'top_activity': str}}."""
     results = {}
     if not text or not packages:
         return results
@@ -328,24 +457,47 @@ def _parse_stack_and_task_ids(text, packages):
         for p in pkg_set
     }
     cur_stack_id = None
+    cur_win_mode = ""
     for line in text.splitlines():
         sm = re.search(r"\bStack\s+id\s*=\s*(\d+)", line)
         if sm:
             cur_stack_id = int(sm.group(1))
+            cur_win_mode = ""
+        wm_m = re.search(r"mWindowingMode=([a-zA-Z0-9_-]+)", line)
+        if wm_m:
+            cur_win_mode = wm_m.group(1).lower()
         matched_pkg = None
         for p, pat in pkg_patterns.items():
             if pat.search(line):
                 matched_pkg = p
                 break
-        if not matched_pkg or matched_pkg in results:
+        if not matched_pkg:
             continue
         m = (
             re.search(r"\btaskId\s*=\s*(\d+)", line)
             or re.search(r"\bTask\s+id\s*#?\s*(\d+)", line, re.IGNORECASE)
             or re.search(r"\bTask\{[^\n]*?#(\d+)\b", line)
         )
-        if m:
-            results[matched_pkg] = {"task_id": int(m.group(1)), "stack_id": cur_stack_id}
+        if not m:
+            continue
+        tid = int(m.group(1))
+        top_m = re.search(r"topActivity=ComponentInfo\{([^}]+)\}", line)
+        top_act = top_m.group(1) if top_m else ""
+        is_trampoline = "ActivityProtocolLaunch" in line
+        is_visible = "visible=true" in line
+        cand = {
+            "task_id": tid,
+            "stack_id": cur_stack_id,
+            "windowing_mode": cur_win_mode,
+            "top_activity": top_act,
+            "visible": is_visible,
+            "trampoline": is_trampoline,
+        }
+        prev = results.get(matched_pkg)
+        if not prev:
+            results[matched_pkg] = cand
+        elif (prev["trampoline"] and not cand["trampoline"]) or (not prev["visible"] and cand["visible"]):
+            results[matched_pkg] = cand
     return results
 
 
@@ -354,8 +506,8 @@ def _parse_task_ids_from_text(text, packages):
     return {p: info["task_id"] for p, info in parsed.items()}
 
 
-def get_package_task_ids(packages, running_only=False):
-    """Return {package: task_id} for open Android tasks (optionally filtered to live PIDs)."""
+def get_package_task_details(packages, running_only=False):
+    """Return {package: {'task_id': int, 'stack_id': int | None, 'windowing_mode': str, 'top_activity': str}}."""
     target_pkgs = [p for p in (packages or []) if p]
     if not target_pkgs:
         return {}
@@ -367,34 +519,46 @@ def get_package_task_ids(packages, running_only=False):
     for cmd in ("am stack list", "am task list", "dumpsys activity activities"):
         rc, out, _ = su(cmd, 12)
         if rc == 0 and out:
-            found = _parse_task_ids_from_text(out, target_pkgs)
+            found = _parse_stack_and_task_ids(out, target_pkgs)
             if found:
                 return found
     return {}
 
 
-def calculate_grid_positions(count, width, height, tiny=False, top_inset=48):
-    """Compute non-overlapping (left, top, right, bottom) rects for `count` windows."""
+def get_package_task_ids(packages, running_only=False):
+    """Return {package: task_id} for open Android tasks (optionally filtered to live PIDs)."""
+    details = get_package_task_details(packages, running_only=running_only)
+    return {p: info["task_id"] for p, info in details.items()}
+
+
+def calculate_grid_positions(
+    count,
+    width,
+    height,
+    tiny=False,
+    top_inset=48,
+    mode="left_to_right",
+    min_size=216,
+    gap=4,
+):
+    """Compute (left, top, right, bottom) rects arranged cleanly left-to-right based on clone count."""
     if count <= 0:
         return []
     width = max(320, int(width))
     height = max(320, int(height))
     top_inset = max(0, min(int(top_inset), height // 4))
     usable_h = max(160, height - top_inset)
+    min_sz = max(160, min(int(min_size), width, usable_h))
+    gap = max(0, int(gap))
 
-    if not tiny and count == 2:
-        if height > width:
-            cols, rows = 1, 2
-        else:
-            cols, rows = 2, 1
-    else:
-        cols = max(1, math.ceil(math.sqrt(count)))
+    eff_mode = "tiny" if tiny else str(mode or "left_to_right").lower()
+
+    if eff_mode == "tiny":
+        cols = max(1, min(count, max(2, width // max(180, min_sz))))
         rows = max(1, math.ceil(count / cols))
-
-    rects = []
-    if tiny:
-        tile_w = max(160, min(280, width // max(2, cols)))
-        tile_h = max(160, min(280, usable_h // max(2, rows)))
+        tile_w = max(min_sz, min(280, width // cols))
+        tile_h = max(min_sz, min(280, usable_h // max(2, rows)))
+        rects = []
         for idx in range(count):
             r = idx // cols
             c = idx % cols
@@ -403,8 +567,93 @@ def calculate_grid_positions(count, width, height, tiny=False, top_inset=48):
             rects.append((left, top, min(width, left + tile_w), min(height, top + tile_h)))
         return rects
 
+    if eff_mode == "horizontal_strip":
+        if width // count >= min_sz:
+            cell_w = width // count
+            row_h = usable_h if width >= height else max(min_sz, int(usable_h * 0.56))
+            bottom = min(height, top_inset + row_h)
+            rects = []
+            for idx in range(count):
+                left = idx * cell_w + (gap if idx > 0 else 0)
+                right = width if idx == count - 1 else (idx + 1) * cell_w - gap
+                if right - left < min_sz:
+                    right = min(width, left + min_sz)
+                rects.append((left, top_inset, right, bottom))
+            return rects
+        tile_w = max(min_sz, width // min(count, 3))
+        tile_h = usable_h if width >= height else max(min_sz, int(usable_h * 0.52))
+        bottom = min(height, top_inset + tile_h)
+        span_x = max(0, width - tile_w)
+        rects = []
+        for idx in range(count):
+            left = round(idx * span_x / max(1, count - 1)) if count > 1 else 0
+            rects.append((left, top_inset, min(width, left + tile_w), bottom))
+        return rects
+
+    if eff_mode == "left_to_right":
+        max_cols = max(1, width // min_sz)
+        if count == 1:
+            if height > width:
+                h1 = max(min_sz, int(usable_h * 0.52))
+                return [(gap, top_inset, max(gap + min_sz, width - gap), min(height, top_inset + h1))]
+            w1 = max(min_sz, width // 2 - gap)
+            return [(gap, top_inset, min(width, gap + w1), max(top_inset + min_sz, height - gap))]
+
+        if count == 2 and max_cols >= 2:
+            cols, rows = 2, 1
+            eff_h = usable_h if width >= height else max(min_sz, int(usable_h * 0.58))
+        elif count == 3 and max_cols >= 3:
+            cols, rows = 3, 1
+            eff_h = usable_h if width >= height else max(min_sz, int(usable_h * 0.52))
+        elif count == 4:
+            cols = 4 if (width >= height and max_cols >= 4) else min(2, max_cols)
+            rows = max(1, math.ceil(count / cols))
+            eff_h = usable_h
+        else:
+            cols = max(1, min(count, max_cols))
+            rows = max(1, math.ceil(count / cols))
+            eff_h = usable_h
+
+        if eff_h // rows >= min_sz:
+            cell_w = width // cols
+            cell_h = eff_h // rows
+            rects = []
+            for idx in range(count):
+                r = idx // cols
+                c = idx % cols
+                left = c * cell_w + (gap if c > 0 else 0)
+                top = top_inset + r * cell_h + (gap if r > 0 else 0)
+                right = width if c == cols - 1 else (c + 1) * cell_w - gap
+                bottom = (top_inset + eff_h) if r == rows - 1 else (top_inset + (r + 1) * cell_h - gap)
+                if right - left < min_sz:
+                    right = min(width, left + min_sz)
+                if bottom - top < min_sz:
+                    bottom = min(height, top + min_sz)
+                rects.append((left, top, right, bottom))
+            return rects
+
+        # Many clones: neat left-to-right cascade so every window title bar stays accessible
+        tile_w = max(min_sz, width // max(1, min(max_cols, 3)))
+        tile_h = max(min_sz, int(usable_h * 0.45))
+        span_x = max(0, width - tile_w)
+        span_y = max(0, usable_h - tile_h)
+        rects = []
+        for idx in range(count):
+            frac = idx / max(1, count - 1)
+            left = round(frac * span_x)
+            top = top_inset + round((idx % max(1, min(count, 4))) * (span_y / max(1, min(count, 4) - 1)))
+            rects.append((left, top, min(width, left + tile_w), min(height, top + tile_h)))
+        return rects
+
+    # Classic balanced grid mode
+    if count == 2:
+        cols, rows = (1, 2) if height > width else (2, 1)
+    else:
+        cols = max(1, math.ceil(math.sqrt(count)))
+        rows = max(1, math.ceil(count / cols))
     cell_w = width // cols
     cell_h = usable_h // rows
+    rects = []
     for idx in range(count):
         r = idx // cols
         c = idx % cols
@@ -416,25 +665,66 @@ def calculate_grid_positions(count, width, height, tiny=False, top_inset=48):
     return rects
 
 
-def sort_roblox_tabs(packages, tiny=False):
-    """Arrange active running Roblox/Delta tasks into a freeform grid (or tiny tiles). Returns resized count."""
+def sort_roblox_tabs(packages=None, tiny=False, mode=None):
+    """Arrange active running Roblox/Delta tasks into freeform windows left-to-right. Returns resized count."""
     ensure_freeform_support()
-    tasks = get_package_task_ids(packages, running_only=True)
+    target_pkgs = [p for p in (packages or []) if p]
+    if not target_pkgs:
+        from rjcore import detect_packages
+        target_pkgs = detect_packages()
+    tasks = get_package_task_details(target_pkgs, running_only=True)
     if not tasks:
         return 0
-    w, h = get_screen_resolution()
-    ordered_pkgs = [p for p in packages if p in tasks]
-    rects = calculate_grid_positions(len(ordered_pkgs), w, h, tiny=tiny)
+    metrics = get_display_metrics()
+    w, h = metrics["width"], metrics["app_bottom"]
+    ordered_pkgs = [p for p in target_pkgs if p in tasks]
+    eff_mode = "tiny" if tiny else (mode or "left_to_right")
+    rects = calculate_grid_positions(
+        len(ordered_pkgs),
+        w,
+        h,
+        tiny=tiny,
+        top_inset=metrics["top_inset"],
+        mode=eff_mode,
+        min_size=metrics["min_size"],
+    )
+    tx_info = _get_set_windowing_mode_tx()
     cmds = []
     for pkg, (l, t, r, b) in zip(ordered_pkgs, rects):
-        tid = tasks[pkg]
-        cmds.append(
-            f"am task resizeable {tid} 2 >/dev/null 2>&1; "
-            f"am task resize {tid} {l} {t} {r} {b} >/dev/null 2>&1 && echo RJ_RESIZED_OK"
-        )
+        tid = tasks[pkg]["task_id"]
+        parts = [f"am task resizeable {tid} 2 >/dev/null 2>&1"]
+        if tx_info:
+            svc, tx_code = tx_info
+            parts.append(f"service call {svc} {tx_code} i32 {tid} i32 5 i32 1 >/dev/null 2>&1")
+        parts.append(f"cmd activity task set-windowing-mode {tid} 5 >/dev/null 2>&1")
+        parts.append(f"wm task windowing-mode {tid} 5 >/dev/null 2>&1")
+        parts.append(f"am task resize {tid} {l} {t} {r} {b} >/dev/null 2>&1 && echo RJ_RESIZED_{tid}")
+        cmds.append("; ".join(parts))
+
     rc, out, _ = su("; ".join(cmds), 15)
+    after = get_package_task_details(ordered_pkgs, running_only=True)
+    relaunch_cmds = []
+    for pkg, (l, t, r, b) in zip(ordered_pkgs, rects):
+        info = after.get(pkg) or tasks.get(pkg)
+        if not info:
+            continue
+        if info.get("windowing_mode") == "fullscreen":
+            top_act = info.get("top_activity") or ""
+            tid = info["task_id"]
+            if top_act and "ActivityProtocolLaunch" not in top_act:
+                relaunch_cmds.append(
+                    f"am start --windowingMode 5 --activity-reorder-to-front --activity-single-top --activity-no-animation -n {shlex.quote(top_act)} >/dev/null 2>&1; "
+                    f"am task resize {tid} {l} {t} {r} {b} >/dev/null 2>&1"
+                )
+    if relaunch_cmds:
+        su("; ".join(relaunch_cmds), 15)
+        after = get_package_task_details(ordered_pkgs, running_only=True)
+
+    freeform_cnt = sum(1 for p in ordered_pkgs if (after.get(p) or {}).get("windowing_mode") == "freeform")
+    if freeform_cnt > 0:
+        return freeform_cnt
     if rc == 0 and out:
-        return out.count("RJ_RESIZED_OK")
+        return out.count("RJ_RESIZED_")
     return 0
 
 

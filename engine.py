@@ -131,6 +131,7 @@ class InstanceWorker(threading.Thread):
         self.force_rejoin_reason = None
         self._pending_job_id = None
         self._latest_log = None
+        self._last_handled_disc_sig = None
         self._state_lock = threading.Lock()
         self._has_profile_override = profile_override is not None
 
@@ -161,6 +162,7 @@ class InstanceWorker(threading.Thread):
         self.notified_rules = set()
         self.challenge_notified = False
         self.target_place_id = None
+        self.target_game_id = None
         self.target_uri = None
 
         self.state = InstanceState(
@@ -646,6 +648,9 @@ class InstanceWorker(threading.Thread):
                 sleep_kill = float(self.mgr.config.get("sleep_after_kill_seconds") or 1.5)
                 if sleep_kill > 0:
                     time.sleep(sleep_kill)
+                self.mgr.log_watcher.reset_package(self.state.package)
+            launch_start_ts = time.time()
+            if not self.dry_run:
                 extra = (self.profile.get("launch_extra") or "").strip()
                 auto_resize = bool(self.mgr.config.get("sort_tabs", True) or self.mgr.config.get("tiny_sort_tabs", False))
                 wmode = str(self.profile.get("window_mode") or "freeform").lower()
@@ -661,11 +666,13 @@ class InstanceWorker(threading.Thread):
                 if rc != 0:
                     self.log(self.state.name, f"am start warning (rc={rc}): {err}")
                 elif auto_resize:
-                    self.mgr.request_tab_sort(2.5)
+                    self.mgr.request_tab_sort(2.5, follow_up=6.5)
             now = time.time()
-            self.launch_ts = now
+            self.launch_ts = launch_start_ts
             self.first_hb_seen = False
             self.last_presence_ts = now
+            self._last_handled_disc_sig = None
+            self.target_game_id = None
             self.mgr.last_launch_ts = now
             self._set_state(session_started_at=now, hb_age=None)
 
@@ -1023,13 +1030,26 @@ class InstanceWorker(threading.Thread):
 
             # Check native Roblox client log disconnects in ALL modes
             log_info = self._get_log_state()
-            disc_grace = 1.5 if self.dry_run else 10.0
-            if log_info and log_info.get("state") == "disconnected" and (now - self.launch_ts) > disc_grace:
-                d_res = self._handle_log_disconnect(log_info)
-                if d_res == "break":
-                    break
-                if d_res == "continue":
-                    continue
+            disc_grace = 1.5 if self.dry_run else 25.0
+            if (
+                log_info
+                and log_info.get("state") == "disconnected"
+                and log_info.get("error_code") is not None
+                and (now - self.launch_ts) > disc_grace
+            ):
+                sig = (
+                    log_info.get("log_path"),
+                    log_info.get("mtime"),
+                    log_info.get("error_code"),
+                    log_info.get("message"),
+                )
+                if sig != self._last_handled_disc_sig:
+                    self._last_handled_disc_sig = sig
+                    d_res = self._handle_log_disconnect(log_info)
+                    if d_res == "break":
+                        break
+                    if d_res == "continue":
+                        continue
 
             # ── Mode A: Online Presence Check (non-executor / VNG) ──
             if check_method == "online":
@@ -1112,10 +1132,21 @@ class InstanceWorker(threading.Thread):
                     if ws_act2 == "continue":
                         continue
 
-                # Wrong place check
+                # Track universe gameId and check wrong place only if strict_place_check is enabled
                 hb_place = hb.get("placeId")
+                hb_game = hb.get("gameId")
+                try:
+                    if hb_game and self.target_place_id and hb_place and int(hb_place) == int(self.target_place_id):
+                        self.target_game_id = int(hb_game)
+                except (TypeError, ValueError):
+                    pass
+                same_universe = bool(
+                    self.target_game_id and hb_game and str(hb_game) == str(self.target_game_id)
+                )
                 if (
-                    self.target_place_id
+                    bool(self.profile.get("strict_place_check", False))
+                    and not same_universe
+                    and self.target_place_id
                     and hb_place
                     and int(hb_place) != int(self.target_place_id)
                     and hb_age < 15.0
@@ -1149,6 +1180,31 @@ class InstanceWorker(threading.Thread):
 
                 # Stale heartbeat
                 if hb_age > hb_timeout:
+                    if (now - self.launch_ts) < launch_grace and (self.dry_run or is_running(self.state.package)):
+                        self._set_state(status="LAUNCHING", last_event=f"loading ({int(now - self.launch_ts)}s)")
+                        continue
+
+                    if not self.dry_run and check_method == "hybrid" and is_running(self.state.package):
+                        if log_info and log_info.get("state") == "joining" and (now - float(log_info.get("mtime") or 0)) < 120.0:
+                            self._set_state(status="LAUNCHING", last_event="joining_or_teleport")
+                            continue
+                        if log_info and log_info.get("state") == "in_game":
+                            if self.cookie and self.state.user_id and (now - self.last_presence_ts) >= 30.0:
+                                self.last_presence_ts = now
+                                ptype, _, _ = check_presence(self.state.user_id, self.cookie)
+                                if ptype in (None, 2):
+                                    self._set_state(status="RUNNING", last_event="in_game_exec_wait")
+                                    continue
+                            else:
+                                self._set_state(status="RUNNING", last_event="in_game_exec_wait")
+                                continue
+                        elif self.cookie and self.state.user_id and (now - self.last_presence_ts) >= 30.0:
+                            self.last_presence_ts = now
+                            ptype, _, _ = check_presence(self.state.user_id, self.cookie)
+                            if ptype == 2:
+                                self._set_state(status="RUNNING", last_event="presence_in_game")
+                                continue
+
                     fails = self.state.consecutive_fails + 1
                     self._set_state(
                         status="REJOINING",
@@ -1309,7 +1365,7 @@ class Manager:
         self.stop_event = threading.Event()
         self.workers = {}
         self._maint_thread = None
-        self._pending_sort_ts = 0.0
+        self._pending_sort_times = []
         self.dry_run = False
         self.enable_ipc = bool(enable_ipc or ipc_sock_path)
         self.ipc_sock_path = ipc_sock_path or DEFAULT_IPC_SOCK
@@ -1321,9 +1377,12 @@ class Manager:
         self.web_token = config.get("web_token", "") if web_token is None else str(web_token)
         self.web_panel = None
 
-    def request_tab_sort(self, delay=2.5):
+    def request_tab_sort(self, delay=2.5, follow_up=None):
         """Schedule an automatic window resize/tile pass shortly after launching a Roblox tab."""
-        self._pending_sort_ts = time.time() + max(0.5, float(delay))
+        now = time.time()
+        self._pending_sort_times.append(now + max(0.5, float(delay)))
+        if follow_up is not None and float(follow_up) > float(delay):
+            self._pending_sort_times.append(now + float(follow_up))
 
     def start(self, instance_names=None, dry_run=False, profile_override=None):
         self.stop_event.clear()
@@ -1382,6 +1441,7 @@ class Manager:
                     "resized": sort_roblox_tabs(
                         [w.state.package for w in self.workers.values()],
                         tiny=bool(a.get("tiny", self.config.get("tiny_sort_tabs", False))),
+                        mode=a.get("mode", self.config.get("sort_tabs_mode", "left_to_right")),
                     )
                 },
                 "stop": lambda _a: (self.stop_event.set() or {"stopping": True}),
@@ -1475,7 +1535,7 @@ class Manager:
                 pkgs = [w.state.package for w in self.workers.values() if w.state.package]
                 usage = get_batch_pkg_usage(pkgs)
                 min_mtimes = {
-                    w.state.package: max(0.0, w.launch_ts - 2.0)
+                    w.state.package: max(0.0, w.launch_ts)
                     for w in self.workers.values()
                     if w.state.package
                 }
@@ -1546,11 +1606,14 @@ class Manager:
 
             if not dry_run and (self.config.get("sort_tabs", True) or self.config.get("tiny_sort_tabs")):
                 sort_sec = max(10.0, float(self.config.get("sort_tabs_interval_seconds") or 15))
-                if (self._pending_sort_ts > 0 and now >= self._pending_sort_ts) or (now - last_sort) >= sort_sec:
-                    self._pending_sort_ts = 0.0
+                due_pending = [t for t in self._pending_sort_times if now >= t]
+                if due_pending or (now - last_sort) >= sort_sec:
+                    self._pending_sort_times = [t for t in self._pending_sort_times if now < t]
                     last_sort = now
                     pkgs = [w.state.package for w in self.workers.values()]
-                    sort_roblox_tabs(pkgs, tiny=bool(self.config.get("tiny_sort_tabs", False)))
+                    tiny_flag = bool(self.config.get("tiny_sort_tabs", False))
+                    sort_mode = "tiny" if tiny_flag else (self.config.get("sort_tabs_mode") or "left_to_right")
+                    sort_roblox_tabs(pkgs, tiny=tiny_flag, mode=sort_mode)
 
     def send_status_embed(self, dry_run=False):
         wh_url = (self.config.get("webhook") or "").strip()

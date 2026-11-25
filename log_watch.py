@@ -19,9 +19,37 @@ ROBLOX_ERROR_CODES = {
 _UUID_RE = re.compile(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b", re.IGNORECASE)
 _PLACE_RE = re.compile(r"(?:place(?:id)?[=: ]+|place\s+)(\d{5,15})", re.IGNORECASE)
 _JOB_KEY_RE = re.compile(r"(?:jobid|gameinstanceid|serverid)[=: ]+([0-9a-f-]{36})", re.IGNORECASE)
+
+VALID_DISCONNECT_CODES = {
+    260, 261, 262, 264, 266, 267, 268, 271, 272, 273, 274, 275,
+    277, 278, 279, 280, 285, 286, 291, 517, 523, 524, 525, 528,
+    529, 533, 600, 769, 772, 773,
+}
+
 _ERR_CODE_RE = re.compile(
-    r"(?:error\s*code|errorcode|disconnect(?:ed)?\s*(?:with\s*)?(?:reason|code)|reason|code)\s*[:=()]?\s*(\d{3})\b",
+    r"\b(?:error\s*code|disconnect(?:ed)?\s*(?:from\s+server\s*,?\s*)?(?:with\s*)?(?:reason|code))\s*[:=()]?\s*(\d{3})\b",
     re.IGNORECASE,
+)
+_ID17_RE = re.compile(r"(?:^|[\s(\[,])id\s*=\s*17\b", re.IGNORECASE)
+_LOG_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[0-9:.]+Z,[0-9.]+,[0-9a-f]+,\d+,\w+\s+", re.IGNORECASE)
+
+_IGNORED_FLOG_MARKERS = (
+    "[flog::jniappbridge]",
+    "[flog::ixpcontroller]",
+    "[flog::humanoidfloorprocess]",
+    "[flog::voicechatlogs]",
+    "[flog::assetsuploadapiflow]",
+    "[flog::graphics]",
+    "[flog::audio]",
+    "[flog::surfacecontroller]",
+    "[flog::preloadedcacheverifier]",
+    "[flog::datamodelpatchconfigurer]",
+    "[flog::avatarautosetup]",
+    "[flog::avatarcreation]",
+    "[flog::photo2avatar]",
+    "[flog::luaappexperiencecontroller]",
+    "videostream:",
+    "mediacodec error",
 )
 
 _JOIN_PATTERNS = (
@@ -31,6 +59,10 @@ _JOIN_PATTERNS = (
     "client:connect(",
     "connecting to ",
     "udpconnect",
+    "doteleport",
+    "initiateteleporttoinstance",
+    "makejoinscriptrequestforteleport",
+    "nativeappbridgev2startgame",
 )
 _IN_GAME_PATTERNS = (
     "connection accepted from",
@@ -38,40 +70,50 @@ _IN_GAME_PATTERNS = (
     "server joined",
     "received join data",
     "networkclient:connectionaccepted",
+    "nativeappbridgev2sendappeventongameloaded",
 )
-_DISCONNECT_PATTERNS = (
-    "disconnect from",
-    "sending disconnect",
+_STRICT_DISCONNECT_PATTERNS = (
     "disconnected from game",
-    "error code:",
-    "errorcode:",
-    "connection lost",
+    "disconnect from server",
     "lost connection",
+    "connection lost",
     "failed to connect to the game",
+    "connection attempt failed",
     "same account launched",
     "kicked from this",
+    "you were kicked",
     "unexpected client behavior",
     "not authorized to join",
-    "id = 17",
-    "id=17",
     "http 529",
     "error 529",
 )
+_ERR_SOURCE_MARKERS = ("[flog::network]", "[flog::output]", "errorprompt", "guiservice")
+
+
+def _clean_log_msg(line):
+    cleaned = _LOG_PREFIX_RE.sub("", line).strip()
+    return (cleaned or line)[-180:]
 
 
 def _infer_error_code(line, low):
     m = _ERR_CODE_RE.search(line)
     if m:
-        return int(m.group(1))
+        code = int(m.group(1))
+        if code in VALID_DISCONNECT_CODES:
+            return code
     if "same account launched" in low:
         return 264
     if "unexpected client behavior" in low:
         return 268
-    if "kicked from this" in low or "was kicked" in low:
+    if "kicked from this" in low or "was kicked" in low or "you were kicked" in low:
         return 267
     if "lost connection" in low or "connection lost" in low:
         return 277
-    if "failed to connect to the game" in low or "id = 17" in low or "id=17" in low:
+    if (
+        "failed to connect to the game" in low
+        or "connection attempt failed" in low
+        or (_ID17_RE.search(line) and ("failed to connect" in low or "[flog::network]" in low))
+    ):
         return 279
     if "not authorized to join" in low:
         return 524
@@ -80,7 +122,7 @@ def _infer_error_code(line, low):
     if "account" in low and ("moderated" in low or "reauth" in low or "another session" in low):
         return 273
     m2 = re.search(r"\b(26[478]|27[379]|52[49])\b", line)
-    if m2:
+    if m2 and any(k in low for k in ("error", "disconnect", "kick", "network", "connection")):
         return int(m2.group(1))
     return None
 
@@ -135,23 +177,31 @@ def parse_roblox_log_tail(text):
             state = "in_game"
             error_code = None
             error_kind = None
-            message = line[-180:]
+            message = _clean_log_msg(line)
             continue
 
         if any(p in low for p in _JOIN_PATTERNS):
             state = "joining"
             error_code = None
             error_kind = None
-            message = line[-180:]
+            message = _clean_log_msg(line)
             continue
 
-        if any(p in low for p in _DISCONNECT_PATTERNS):
-            code = _infer_error_code(line, low)
-            state = "disconnected"
-            error_code = code
-            error_kind = ROBLOX_ERROR_CODES.get(code, "disconnected") if code else "disconnected"
-            message = line[-180:]
+        if any(ign in low for ign in _IGNORED_FLOG_MARKERS):
             continue
+
+        has_strict_pat = any(p in low for p in _STRICT_DISCONNECT_PATTERNS)
+        has_err_src = any(s in low for s in _ERR_SOURCE_MARKERS) and bool(_ERR_CODE_RE.search(line))
+        has_id17 = bool(_ID17_RE.search(line)) and ("failed to connect" in low or "connection attempt failed" in low or "[flog::network]" in low)
+
+        if has_strict_pat or has_err_src or has_id17:
+            code = _infer_error_code(line, low)
+            if code is not None:
+                state = "disconnected"
+                error_code = code
+                error_kind = ROBLOX_ERROR_CODES.get(code, "disconnected")
+                message = _clean_log_msg(line)
+                continue
 
     return {
         "state": state,

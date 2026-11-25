@@ -381,6 +381,7 @@ def load_config():
     cfg.setdefault("open_delay_seconds", 2)
     cfg.setdefault("sleep_after_kill_seconds", 2)
     cfg.setdefault("sort_tabs", True)
+    cfg.setdefault("sort_tabs_mode", "left_to_right")
     cfg.setdefault("tiny_sort_tabs", False)
     cfg.setdefault("sort_tabs_interval_seconds", 15)
     cfg.setdefault("kill_all_on_crash", False)
@@ -404,6 +405,11 @@ def load_config():
         cfg["sort_tabs"] = True
         cfg["_auto_resize_v5"] = True
         save_config(cfg)
+    if os.path.exists(CONFIG) and not cfg.get("_auto_resize_v6"):
+        cfg["sort_tabs"] = True
+        cfg["sort_tabs_mode"] = "tiny" if cfg.get("tiny_sort_tabs") else (cfg.get("sort_tabs_mode") or "left_to_right")
+        cfg["_auto_resize_v6"] = True
+        save_config(cfg)
     return cfg
 
 
@@ -417,9 +423,10 @@ DEFAULT_PROFILE = {
     "job_id": "",
     "rejoin_after_minutes": 30,
     "rotate_after_minutes": 0,
-    "heartbeat_timeout": 45,
-    "launch_grace": 90,
+    "heartbeat_timeout": 120,
+    "launch_grace": 180,
     "poll_interval": 3,
+    "strict_place_check": False,
     "max_rejoins_before_rotate": 0,
     "check_method": "hybrid",
     "check_presence": False,

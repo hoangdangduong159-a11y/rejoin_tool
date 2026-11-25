@@ -14,10 +14,6 @@ if genv._RejoinToolLoaded then
 end
 genv._RejoinToolLoaded = true
 
-if not game:IsLoaded() then
-    game.Loaded:Wait()
-end
-
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 local GuiService = game:GetService("GuiService")
@@ -31,17 +27,52 @@ if genv._RejoinFpsCap and setfpscap then
     pcall(setfpscap, genv._RejoinFpsCap)
 end
 
-local player = Players.LocalPlayer
-while not player do
-    task.wait(0.2)
-    player = Players.LocalPlayer
-end
-
 pcall(function()
     if isfolder and makefolder and not isfolder("rejoin") then
         makefolder("rejoin")
     end
 end)
+
+local loadingDone = game:IsLoaded()
+task.spawn(function()
+    while not loadingDone do
+        local lp = Players.LocalPlayer
+        if lp and writefile then
+            pcall(function()
+                writefile("rejoin/hb_" .. tostring(lp.UserId) .. ".json", HttpService:JSONEncode({
+                    time = os.time(),
+                    placeId = game.PlaceId,
+                    gameId = game.GameId,
+                    placeVersion = game.PlaceVersion,
+                    jobId = game.JobId,
+                    userId = lp.UserId,
+                    username = lp.Name,
+                    status = "loading",
+                    reason = "game_loading",
+                    kicked = false,
+                    kickMsg = "",
+                    antiAfk = true,
+                    fps = 0,
+                    ping = 0,
+                    playersCount = 0,
+                    stats = {},
+                }))
+            end)
+        end
+        task.wait(4)
+    end
+end)
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+loadingDone = true
+
+local player = Players.LocalPlayer
+while not player do
+    task.wait(0.2)
+    player = Players.LocalPlayer
+end
 
 local hbPath = "rejoin/hb_" .. tostring(player.UserId) .. ".json"
 
@@ -84,6 +115,7 @@ local function writeHeartbeat()
     local payload = {
         time = os.time(),
         placeId = game.PlaceId,
+        gameId = game.GameId,
         placeVersion = game.PlaceVersion,
         jobId = game.JobId,
         userId = player.UserId,
@@ -194,7 +226,17 @@ end
 pcall(function()
     GuiService.ErrorMessageChanged:Connect(function(msg)
         if msg and msg ~= "" then
-            markKicked(msg)
+            local errCodeVal = 0
+            pcall(function()
+                if GuiService.GetErrorCode then
+                    local ec = GuiService:GetErrorCode()
+                    errCodeVal = (ec and ec.Value) or tonumber(ec) or 0
+                end
+            end)
+            local low = string.lower(tostring(msg))
+            if errCodeVal ~= 0 or string.find(low, "kick") or string.find(low, "disconnect") or string.find(low, "error code") or string.find(low, "lost connection") then
+                markKicked(msg)
+            end
         end
     end)
 end)
@@ -234,7 +276,7 @@ end)
 
 writeHeartbeat()
 task.spawn(function()
-    while task.wait(5) do
+    while task.wait(4) do
         writeHeartbeat()
     end
 end)
